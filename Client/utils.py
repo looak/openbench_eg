@@ -177,7 +177,8 @@ def check_for_engine_binary(out_path):
 def makefile_command(net_path, make_path, out_path, compiler):
 
     # Build with -j, and EXE= to contol the output location
-    command = ['make', '-j', 'EXE=%s' % (out_path)]
+    # limiting to 4 threads to avoid OOM on low-RAM systems
+    command = ['make', '-j4', 'EXE=%s' % (out_path)]
 
     # Build with CC/CXX= when using a custom compiler
     if compiler:
