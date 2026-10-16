@@ -42,7 +42,7 @@ from OpenBench.models import *
 from django.contrib.auth.models import User
 from OpenSite.settings import MEDIA_ROOT
 
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.db.models import F, Q
 from django.http import HttpResponse, JsonResponse, FileResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -689,7 +689,10 @@ def client_get_network(request, engine, name):
 @csrf_exempt
 @verify_worker
 def client_get_workload(request, machine):
-    return JsonResponse(get_workload(request, machine))
+    try:
+        return JsonResponse(get_workload(request, machine))
+    except IntegrityError as error:
+        return JsonResponse({ 'error' : f'IntegrityError: {error}' })
 
 @csrf_exempt
 @verify_worker

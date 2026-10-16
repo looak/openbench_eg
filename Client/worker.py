@@ -951,7 +951,7 @@ def server_request_workload(config):
     except json.decoder.JSONDecodeError:
         status_code = response.status_code
         content_type = response.headers.get('Content-Type', 'unknown')
-        snippet = response.text[:400].replace('\n', ' ').replace('\r', ' ')
+        snippet = response.text[:4000].replace('\n', ' ').replace('\r', ' ')
         message = (
             f'Non-JSON response from {target} '
             f'(status={status_code}, content-type={content_type}): {snippet}'
