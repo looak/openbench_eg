@@ -34,6 +34,7 @@ from OpenBench.config import OPENBENCH_CONFIG
 from OpenBench.models import Result, Test
 
 from django.db import transaction
+from django.db import IntegrityError
 
 def get_workload(request, machine):
 
@@ -42,7 +43,12 @@ def get_workload(request, machine):
         return {}
 
     # Avoid creating duplicate Result objects
-    result, created = Result.objects.get_or_create(test=test, machine=machine)
+    try:
+        result, created = Result.objects.get_or_create(test=test, machine=machine)
+    except IntegrityError:
+        result = Result.objects.filter(test=test, machine=machine).order_by('-id').first()
+        if result is None:
+            raise
 
     # Update the Machine's status and save everything
     machine.workload = test.id;
