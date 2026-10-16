@@ -111,6 +111,7 @@ class OpenBenchConfig(django.apps.AppConfig):
             self.pgn_watcher.join()
 
         if hasattr(self, 'nyayo_reporter') and self.nyayo_reporter is not None:
+            from OpenBench.nyayo import stop_report_loop
             stop_report_loop()
 
         # Cleanup Lockfile if we hold it
