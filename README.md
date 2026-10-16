@@ -8,3 +8,18 @@ OpenBench is the primary testing framework used for the development of [Ethereal
 You can join OpenBench's [Discord server](https://discord.com/invite/9MVg7fBTpM) to join the discussion, see what developers are working on and talking about, or to find out how you can contribute to the project and become a part of it. OpenBench is heavily inspired by [Fishtest](https://github.com/glinscott/fishtest). The project is powered by the [Django Web Framework](https://www.djangoproject.com/) and [Cutechess](https://github.com/cutechess/cutechess).
 
 Documentation for OpenBench is available in the [Wiki](https://github.com/AndyGrant/OpenBench/wiki)
+
+## Local isolated smoke test
+
+To validate server/client API compatibility before redeploying, run:
+
+```bash
+python Scripts/smoke_client_server.py
+```
+
+This uses [settings_isolated.py](./OpenSite/settings_isolated.py) to create a temporary isolated SQLite database, starts a local Django server, creates an enabled test user/profile, and verifies JSON responses for:
+
+- `clientVersionRef`
+- `clientMatchRunnerVersionRef`
+- `clientWorkerInfo`
+- `clientGetWorkload`
