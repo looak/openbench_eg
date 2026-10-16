@@ -144,11 +144,29 @@ def download_client_files(args):
                     zip_file.extractall(temp_dir)
 
                 # Copy all files except client.py
-                client_dir = os.path.join(temp_dir, 'OpenBench-%s' % (repo_ref), 'Client')
+                extracted_roots = [
+                    os.path.join(temp_dir, entry)
+                    for entry in os.listdir(temp_dir)
+                    if os.path.isdir(os.path.join(temp_dir, entry))
+                ]
+                client_dirs = [
+                    os.path.join(root, 'Client')
+                    for root in extracted_roots
+                    if os.path.isdir(os.path.join(root, 'Client'))
+                ]
+                if len(client_dirs) != 1:
+                    raise Exception('Unable to locate extracted Client directory in archive')
+
+                copied_files = 0
+                client_dir = client_dirs[0]
                 for root, dirs, files in os.walk(client_dir):
                     for file in files:
                         if file != 'client.py':
                             shutil.copy2(os.path.join(root, file), os.path.join(os.getcwd(), file))
+                            copied_files += 1
+
+                if copied_files == 0:
+                    raise Exception('Client archive contained no updatable files')
 
     except:
         raise Exception('Unable to extract .zip archive contents')
