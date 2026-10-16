@@ -14,6 +14,7 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 MANAGE = ROOT / "manage.py"
+CONFIG_FILE = ROOT / "Config" / "config.json"
 
 
 def find_free_port():
@@ -35,6 +36,39 @@ def create_enabled_user(env, username, password):
         f"u.set_password('{password}'); u.save(); "
         "p, _ = Profile.objects.get_or_create(user=u); "
         "p.enabled = True; p.save()"
+    )
+    run_manage(["shell", "-c", shell_cmd], env)
+
+def create_active_workload(env, author, engine_name, book_name):
+    shell_cmd = (
+        "from OpenBench.models import Engine, Test; "
+        f"dev = Engine.objects.create(name='{engine_name}-dev', source='https://example.invalid/dev', sha='d'*40, bench=1); "
+        f"base = Engine.objects.create(name='{engine_name}-base', source='https://example.invalid/base', sha='b'*40, bench=1); "
+        "Test.objects.create("
+        f"author='{author}', "
+        f"book_name='{book_name}', "
+        "dev=dev, "
+        "base=base, "
+        "dev_repo='https://example.invalid/dev', "
+        f"dev_engine='{engine_name}', "
+        "dev_options='Threads=1 Hash=16', "
+        "dev_network='', "
+        "dev_netname='', "
+        "dev_time_control='N=1000', "
+        "base_repo='https://example.invalid/base', "
+        f"base_engine='{engine_name}', "
+        "base_options='Threads=1 Hash=16', "
+        "base_network='', "
+        "base_netname='', "
+        "base_time_control='N=1000', "
+        "workload_size=2, "
+        "priority=1, "
+        "throughput=100, "
+        "approved=True, "
+        "awaiting=False, "
+        "finished=False, "
+        "deleted=False"
+        ")"
     )
     run_manage(["shell", "-c", shell_cmd], env)
 
@@ -64,7 +98,18 @@ def assert_json(response, endpoint):
         raise RuntimeError(f"{endpoint} returned non-JSON body: {response.text[:300]}") from exc
 
 
-def run_smoke(base_url, username, password):
+def pick_engine_for_workload(build_info):
+    for engine_name, info in build_info.items():
+        if info.get("private"):
+            continue
+        systems = info.get("systems") or []
+        compilers = info.get("compilers") or []
+        if systems and compilers:
+            return engine_name, info
+    raise RuntimeError("No public engine with systems/compilers found in clientGetBuildInfo")
+
+
+def run_smoke(base_url, env, username, password):
     auth_payload = {"username": username, "password": password}
 
     version_ref = assert_json(
@@ -83,12 +128,25 @@ def run_smoke(base_url, username, password):
         if key not in runner_ref:
             raise RuntimeError(f"clientMatchRunnerVersionRef missing key '{key}'")
 
+    build_info = assert_json(
+        requests.get(f"{base_url}/clientGetBuildInfo/", timeout=10),
+        "clientGetBuildInfo",
+    )
+    engine_name, engine_build = pick_engine_for_workload(build_info)
+
+    config_data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    if not config_data.get("books"):
+        raise RuntimeError("config.json has no books configured")
+    create_active_workload(env, username, engine_name, config_data["books"][0])
+
     system_info = {
-        "compilers": {},
+        "compilers": {
+            engine_name: [engine_build["compilers"][0], "smoke"],
+        },
         "tokens": {},
-        "cpu_flags": ["POPCNT", "BMI2", "AVX2", "FMA"],
+        "cpu_flags": engine_build.get("cpuflags", []),
         "cpu_name": "smoke-cpu",
-        "os_name": "Linux",
+        "os_name": engine_build["systems"][0],
         "os_ver": "smoke",
         "python_ver": "3.x",
         "mac_address": "001122334455",
@@ -131,11 +189,13 @@ def run_smoke(base_url, username, password):
     )
     if "error" in workload_response:
         raise RuntimeError(f"clientGetWorkload returned error: {workload_response['error']}")
+    if "workload" not in workload_response:
+        raise RuntimeError(f"clientGetWorkload returned no workload: {workload_response}")
 
     print("SMOKE PASS")
     print(f"  client_version={version_ref['client_version']}")
     print(f"  machine_id={machine_id}")
-    print(f"  workload_present={bool(workload_response.get('workload'))}")
+    print(f"  workload_id={workload_response['workload']['test']['id']}")
 
 
 def main():
@@ -169,7 +229,7 @@ def main():
         )
 
         wait_for_server(server_url, args.username, args.password)
-        run_smoke(server_url, args.username, args.password)
+        run_smoke(server_url, env, args.username, args.password)
 
     finally:
         if server_proc is not None:
