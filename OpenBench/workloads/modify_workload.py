@@ -27,7 +27,10 @@
 
 import OpenBench.views
 
+from django.db import transaction
+
 from OpenBench.models import *
+from OpenBench.nyayo import enqueue_report
 
 def modify_workload(request, id, action=None):
 
@@ -58,6 +61,7 @@ def modify_workload(request, id, action=None):
     message = actions[action](request, profile, workload)
     LogEvent.objects.create(author=request.user.username, summary=action, log_file='', test_id=id)
     workload.save()
+    transaction.on_commit(lambda: enqueue_report(id))
 
     # Send back to the index, notifying them of the success
     return OpenBench.views.redirect(request, '/index/', status=message)

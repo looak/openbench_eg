@@ -40,6 +40,7 @@ from OpenSite.settings import MEDIA_ROOT, PROJECT_PATH
 
 from OpenBench.config import OPENBENCH_CONFIG
 from OpenBench.models import *
+from OpenBench.nyayo import enqueue_report
 from OpenBench.stats import TrinomialSPRT, PentanomialSPRT
 
 
@@ -478,6 +479,8 @@ def update_test(request, machine):
             test.passed = test.finished = test.games >= test.max_games
 
         test.save()
+
+    transaction.on_commit(lambda: enqueue_report(test.id))
 
     # Update Result object; No risk from concurrent access
     Result.objects.filter(id=result_id).update(

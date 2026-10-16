@@ -33,6 +33,7 @@ from OpenBench.workloads.get_workload import get_workload
 from OpenBench.workloads.modify_workload import modify_workload
 from OpenBench.workloads.verify_workload import verify_workload
 from OpenBench.workloads.view_workload import view_workload
+from OpenBench.nyayo import enqueue_report
 
 from OpenBench.config import OPENBENCH_CONFIG, OPENBENCH_CONFIG_CHECKSUM, OPENBENCH_STATIC_VERSION
 from OpenSite.settings import PROJECT_PATH
@@ -690,6 +691,8 @@ def client_bench_error(request, machine):
         log_file   = '',
         machine_id = int(request.POST['machine_id']),
         test_id    = int(request.POST['test_id']))
+
+    transaction.on_commit(lambda: enqueue_report(test.id))
 
     return JsonResponse({})
 

@@ -74,9 +74,12 @@ class OpenBenchConfig(django.apps.AppConfig):
 
         from OpenBench.watcher import ArtifactWatcher
         from OpenBench.pgn_watcher import PGNWatcher
+        from OpenBench.nyayo import start_report_loop, stop_report_loop
 
         # Result of fopen(LOCKFILE_PATH) after obtaining the lock, otherwise None
         self.lockfile = acquire_watcher_lockfile()
+
+        self.nyayo_reporter = start_report_loop()
 
         if self.lockfile:
 
@@ -106,6 +109,9 @@ class OpenBenchConfig(django.apps.AppConfig):
         if hasattr(self, 'pgn_watcher') and self.pgn_watcher.is_alive():
             self.stop_pgn_watcher.set()
             self.pgn_watcher.join()
+
+        if hasattr(self, 'nyayo_reporter') and self.nyayo_reporter is not None:
+            stop_report_loop()
 
         # Cleanup Lockfile if we hold it
         if self.lockfile:
