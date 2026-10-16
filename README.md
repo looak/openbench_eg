@@ -23,3 +23,11 @@ This uses [settings_isolated.py](./OpenSite/settings_isolated.py) to create a te
 - `clientMatchRunnerVersionRef`
 - `clientWorkerInfo`
 - `clientGetWorkload`
+
+It also seeds an active workload and runs a short `Client/client.py` subprocess smoke check to detect:
+
+- client self-update loops (`Downloading newer version of Client...`)
+- bad workload JSON responses (`OpenBenchBadServerResponseException`)
+- client/server version contract mismatches (`Bad Client Version`)
+
+If `make` is not on `PATH`, the subprocess phase is skipped (endpoint and workload checks still run).

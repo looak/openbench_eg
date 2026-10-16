@@ -1,4 +1,5 @@
 import argparse
+import collections
 import json
 import os
 import shutil
@@ -197,6 +198,108 @@ def run_smoke(base_url, env, username, password):
     print(f"  machine_id={machine_id}")
     print(f"  workload_id={workload_response['workload']['test']['id']}")
 
+def run_client_process_smoke(base_url, username, password, timeout_seconds=120):
+    if shutil.which("make") is None:
+        print("CLIENT PROCESS SKIPPED (make not found on PATH)")
+        return
+
+    client_dir = ROOT / "Client"
+    cmd = [
+        sys.executable,
+        "-u",
+        str(client_dir / "client.py"),
+        "-U",
+        username,
+        "-P",
+        password,
+        "-S",
+        base_url,
+        "-T",
+        "1",
+        "-N",
+        "1",
+        "--no-client-downloads",
+    ]
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=client_dir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        deadline = time.time() + timeout_seconds
+        saw_request = False
+        request_seen_at = None
+        log_tail = collections.deque(maxlen=200)
+
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+
+            line = proc.stdout.readline()
+            if not line:
+                if saw_request and request_seen_at and time.time() - request_seen_at >= 5:
+                    print("CLIENT PROCESS PASS")
+                    return
+                time.sleep(0.1)
+                continue
+
+            line = line.rstrip()
+            log_tail.append(line)
+
+            if "Requesting Workload from Server..." in line:
+                saw_request = True
+                request_seen_at = time.time()
+            if "Downloading newer version of Client..." in line:
+                raise RuntimeError(
+                    "client.py entered self-update loop during smoke run\n"
+                    + "\n".join(log_tail)
+                )
+            if "OpenBenchBadServerResponseException" in line:
+                raise RuntimeError(
+                    "client.py got OpenBenchBadServerResponseException during smoke run\n"
+                    + "\n".join(log_tail)
+                )
+            if "Unable to reach the server to request a workload!" in line:
+                raise RuntimeError(
+                    "client.py failed workload request during smoke run\n" + "\n".join(log_tail)
+                )
+            if "Bad Client Version" in line:
+                raise RuntimeError(
+                    "client.py got Bad Client Version during smoke run\n"
+                    + "\n".join(log_tail)
+                )
+
+            if saw_request and request_seen_at and time.time() - request_seen_at >= 5:
+                print("CLIENT PROCESS PASS")
+                return
+
+        if not saw_request:
+            raise RuntimeError(
+                "client.py never reached workload request in smoke run\n" + "\n".join(log_tail)
+            )
+        raise RuntimeError(
+            "client.py did not stabilize after workload request in smoke run\n"
+            + "\n".join(log_tail)
+        )
+
+    finally:
+        if "proc" in locals() and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Run isolated OpenBench server/client endpoint smoke test")
@@ -230,6 +333,7 @@ def main():
 
         wait_for_server(server_url, args.username, args.password)
         run_smoke(server_url, env, args.username, args.password)
+        run_client_process_smoke(server_url, args.username, args.password)
 
     finally:
         if server_proc is not None:
