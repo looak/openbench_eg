@@ -204,6 +204,20 @@ def run_client_process_smoke(base_url, username, password, timeout_seconds=120):
         return
 
     client_dir = ROOT / "Client"
+    import_probe = subprocess.run(
+        [sys.executable, "-c", "import worker"],
+        cwd=client_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if import_probe.returncode != 0:
+        raise RuntimeError(
+            "client.py preflight failed: unable to import worker module\n"
+            "This is usually a missing client dependency in the current Python env.\n\n"
+            f"{import_probe.stdout}"
+        )
+
     cmd = [
         sys.executable,
         "-u",
