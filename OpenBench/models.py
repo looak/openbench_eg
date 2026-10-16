@@ -82,7 +82,11 @@ class Result(Model):
     # Overall collection of Results
     games    = IntegerField(default=0)
     dev_nodes  = BigIntegerField(default=0)
+    dev_time = BigIntegerField(default=0)
+    dev_time_scaled = BigIntegerField(default=0)
     base_nodes = BigIntegerField(default=0)
+    base_time = BigIntegerField(default=0)
+    base_time_scaled = BigIntegerField(default=0)
     crashes  = IntegerField(default=0)
     timeloss = IntegerField(default=0)
 

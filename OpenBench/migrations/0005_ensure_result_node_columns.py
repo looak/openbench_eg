@@ -9,7 +9,14 @@ def ensure_result_node_columns(apps, schema_editor):
         table_description = connection.introspection.get_table_description(cursor, table_name)
     existing_columns = {column.name for column in table_description}
 
-    for column_name in ("dev_nodes", "base_nodes"):
+    for column_name in (
+        "dev_nodes",
+        "dev_time",
+        "dev_time_scaled",
+        "base_nodes",
+        "base_time",
+        "base_time_scaled",
+    ):
         if column_name in existing_columns:
             continue
         quoted_table = schema_editor.quote_name(table_name)
