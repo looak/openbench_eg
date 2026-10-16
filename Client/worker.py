@@ -949,7 +949,14 @@ def server_request_workload(config):
     # Server errors produce garbage back, which we should not alarm a user with
     try: response = response.json()
     except json.decoder.JSONDecodeError:
-        raise utils.OpenBenchBadServerResponseException() from None
+        status_code = response.status_code
+        content_type = response.headers.get('Content-Type', 'unknown')
+        snippet = response.text[:400].replace('\n', ' ').replace('\r', ' ')
+        message = (
+            f'Non-JSON response from {target} '
+            f'(status={status_code}, content-type={content_type}): {snippet}'
+        )
+        raise utils.OpenBenchBadServerResponseException(message) from None
 
     # Throw all the way back to the client.py
     if 'Bad Client Version' in response.get('error', ''):

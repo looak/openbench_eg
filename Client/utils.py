@@ -72,8 +72,8 @@ class OpenBenchMissingArtifactException(Exception):
         super().__init__(self.name, self.logs)
 
 class OpenBenchBadServerResponseException(Exception):
-    def __init__(self):
-        self.message = ''
+    def __init__(self, message=''):
+        self.message = message
         super().__init__(self.message)
 
 class OpenBenchFailedGenfensException(Exception):
