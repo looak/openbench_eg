@@ -1,5 +1,5 @@
 {
-    "client_version"  : 38,
+    "client_version"  : 50,
     "client_repo_url" : "https://github.com/looak/openbench_eg",
     "client_repo_ref" : "master",
     "fastchess_min_version" : "1.8.1",
