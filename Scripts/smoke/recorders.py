@@ -1,0 +1,167 @@
+# Two HTTP recorders, threads in the harness. The client recorder sits between
+# client.py and the server and logs what the worker said; the nyayo recorder
+# stands in for nyayo and logs every report the server's reporter sent.
+
+import json
+import re
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import requests
+
+
+class Recorder:
+
+    # A ThreadingHTTPServer that can be taken down and brought back on the same port
+
+    def __init__(self, name):
+        self.name   = name
+        self.port   = 0
+        self.httpd  = None
+        self.thread = None
+        self.lock   = threading.Lock()
+
+    @property
+    def url(self):
+        return 'http://127.0.0.1:%d' % (self.port)
+
+    def handle(self, handler, method):
+        raise NotImplementedError
+
+    def start(self):
+        recorder = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def do_GET(self):  recorder.handle(self, 'GET')
+            def do_POST(self): recorder.handle(self, 'POST')
+            def do_PUT(self):  recorder.handle(self, 'PUT')
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd  = ThreadingHTTPServer(('127.0.0.1', self.port), Handler)
+        self.port   = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, name=self.name, daemon=True)
+        self.thread.start()
+        return self
+
+    def stop(self):
+        if self.httpd is not None:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+            self.httpd = None
+
+    @staticmethod
+    def read_body(handler):
+        length = int(handler.headers.get('Content-Length') or 0)
+        return handler.rfile.read(length) if length else b''
+
+    @staticmethod
+    def respond(handler, status, body, content_type='application/json'):
+        handler.send_response(status)
+        handler.send_header('Content-Type', content_type)
+        handler.send_header('Content-Length', str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+
+class ClientRecorder(Recorder):
+
+    # Forwards every request to the server. Requests for the paths in `watched` are
+    # handed to on_event(path, form, forward), which must call forward() exactly once;
+    # the harness uses it to snapshot the Test row before and after.
+
+    def __init__(self, target, on_event, watched):
+        super().__init__('smoke-client-recorder')
+        self.target   = target
+        self.on_event = on_event
+        self.watched  = watched
+        self.log      = []
+
+    def handle(self, handler, method):
+        body    = self.read_body(handler)
+        path    = handler.path
+        ctype   = handler.headers.get('Content-Type', '')
+        entry   = { 't' : time.time(), 'method' : method, 'path' : path, 'form' : {} }
+
+        if ctype.startswith('application/x-www-form-urlencoded'):
+            entry['form'] = { k : v[-1] for k, v in urllib.parse.parse_qs(body.decode()).items() }
+
+        def forward():
+            response = requests.request(
+                method, self.target + path, data=body, allow_redirects=False, timeout=60,
+                headers={ 'Content-Type' : ctype } if ctype else {})
+            entry['status'] = response.status_code
+            entry['reply']  = response.text[:500]
+            return response
+
+        endpoint = path.strip('/').split('/')[0].split('?')[0]
+        try:
+            if endpoint in self.watched:
+                response = self.on_event(endpoint, entry, forward)
+            else:
+                response = forward()
+        except requests.RequestException as error:
+            entry['status'] = 502
+            entry['reply']  = str(error)
+            with self.lock: self.log.append(entry)
+            return self.respond(handler, 502, str(error).encode(), 'text/plain')
+
+        with self.lock: self.log.append(entry)
+        self.respond(handler, response.status_code, response.content,
+                     response.headers.get('Content-Type', 'application/octet-stream'))
+
+
+class NyayoRecorder(Recorder):
+
+    # Answers like nyayo, 201 for a new match and 200 after, and keeps every document.
+    # Anything but an authorised PUT /api/matches/openbench-<instance>-<id> is a violation.
+
+    def __init__(self, token, instance):
+        super().__init__('smoke-nyayo-recorder')
+        self.token      = token
+        self.pattern    = re.compile(r'^/api/matches/(openbench-%s-(\d+))$' % (re.escape(instance)))
+        self.reports    = []
+        self.violations = []
+        self.seen       = set()
+
+    def handle(self, handler, method):
+        body  = self.read_body(handler)
+        path  = handler.path
+        match = self.pattern.match(path)
+        auth  = handler.headers.get('Authorization', '')
+
+        problem = None
+        if method != 'PUT':
+            problem = '%s instead of PUT' % (method)
+        elif not match:
+            problem = 'unknown path'
+        elif auth != 'Bearer %s' % (self.token):
+            problem = 'bad Authorization header %r' % (auth)
+
+        try:
+            document = json.loads(body.decode() or 'null')
+        except ValueError:
+            document, problem = None, problem or 'body is not JSON'
+
+        if not problem and (not isinstance(document, dict) or document.get('id') != match.group(1)):
+            problem = 'document id does not match the path'
+
+        with self.lock:
+            if problem:
+                self.violations.append({ 't' : time.time(), 'method' : method, 'path' : path, 'problem' : problem })
+                return self.respond(handler, 400, json.dumps({ 'error' : problem }).encode())
+
+            status = 200 if match.group(1) in self.seen else 201
+            self.seen.add(match.group(1))
+            self.reports.append({ 't' : time.time(), 'test_id' : int(match.group(2)), 'document' : document, 'status' : status })
+
+        self.respond(handler, status, json.dumps({ 'id' : match.group(1) }).encode())
+
+    def for_test(self, test_id):
+        with self.lock:
+            return [x for x in self.reports if x['test_id'] == test_id]

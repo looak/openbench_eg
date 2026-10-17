@@ -323,6 +323,7 @@ def main():
     parser.add_argument("--full", action="store_true", help="Build an engine, play games, check every report (Linux/WSL)")
     parser.add_argument("--only", default="", help="--full: comma-separated scenario numbers to run")
     parser.add_argument("--keep", action="store_true", help="--full: keep the temp directory and logs")
+    parser.add_argument("--verbose", action="store_true", help="--full: print the details of expected failures")
     args = parser.parse_args()
 
     if args.full:
