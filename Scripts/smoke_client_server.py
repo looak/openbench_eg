@@ -320,7 +320,18 @@ def main():
     parser.add_argument("--username", default="smoke")
     parser.add_argument("--password", default="smoke-pass")
     parser.add_argument("--port", type=int, default=0, help="Port for local runserver, 0 chooses a free port")
+    parser.add_argument("--full", action="store_true", help="Build an engine, play games, check every report (Linux/WSL)")
+    parser.add_argument("--only", default="", help="--full: comma-separated scenario numbers to run")
+    parser.add_argument("--keep", action="store_true", help="--full: keep the temp directory and logs")
     args = parser.parse_args()
+
+    if args.full:
+        sys.path.insert(0, str(ROOT / "Scripts"))
+        from smoke import full
+        try:
+            sys.exit(full.main(args))
+        except full.SmokeFailure as error:
+            sys.exit(f"SMOKE FULL FAIL: {error}")
 
     port = args.port or find_free_port()
     server_url = f"http://127.0.0.1:{port}"

@@ -24,7 +24,7 @@ import os
 import sys
 import traceback
 
-from OpenSite.settings import PROJECT_PATH
+from OpenSite.settings import OPENBENCH_CONFIG_DIR
 
 OPENBENCH_STATIC_VERSION = 'v6'
 
@@ -33,7 +33,7 @@ OPENBENCH_CONFIG_CHECKSUM = None # Initialized by OpenBench/apps.py
 
 def create_openbench_config():
 
-    with open(os.path.join(PROJECT_PATH, 'Config', 'config.json')) as fin:
+    with open(os.path.join(OPENBENCH_CONFIG_DIR, 'Config', 'config.json')) as fin:
         config_dict = json.load(fin)
         verify_general_config(config_dict)
 
@@ -56,7 +56,7 @@ def create_openbench_config():
 
 def load_book_config(book_name):
 
-    with open(os.path.join(PROJECT_PATH, 'Books', '%s.json' % (book_name))) as fin:
+    with open(os.path.join(OPENBENCH_CONFIG_DIR, 'Books', '%s.json' % (book_name))) as fin:
         conf = json.load(fin)
 
     assert type(conf.get('sha')) == str
@@ -67,7 +67,7 @@ def load_book_config(book_name):
 def load_engine_config(engine_name):
 
     try:
-        with open(os.path.join(PROJECT_PATH, 'Engines', '%s.json' % (engine_name))) as fin:
+        with open(os.path.join(OPENBENCH_CONFIG_DIR, 'Engines', '%s.json' % (engine_name))) as fin:
             conf = json.load(fin)
 
         verify_engine_basics(conf)
@@ -126,7 +126,7 @@ def verify_engine_build(engine_name, conf):
 
     if conf['private']: # Private engines require a PAT
         fname = 'credentials.%s' % (engine_name.replace(' ', '').lower())
-        assert os.path.exists(os.path.join(PROJECT_PATH, 'Config', fname))
+        assert os.path.exists(os.path.join(OPENBENCH_CONFIG_DIR, 'Config', fname))
 
     else: # Public engines require a Makefile path and valid compilers
         assert type(conf['build'].get('path')) == str

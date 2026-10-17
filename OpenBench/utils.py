@@ -36,7 +36,7 @@ from django.http import FileResponse
 from django.utils import timezone
 from wsgiref.util import FileWrapper
 
-from OpenSite.settings import MEDIA_ROOT, PROJECT_PATH
+from OpenSite.settings import MEDIA_ROOT, OPENBENCH_CONFIG_DIR
 
 from OpenBench.config import OPENBENCH_CONFIG
 from OpenBench.models import *
@@ -138,7 +138,7 @@ def workload_uses_time_based_tc(workload):
 
 def read_git_credentials(engine):
     fname = 'credentials.%s' % (engine.replace(' ', '').lower())
-    fpath = os.path.join(PROJECT_PATH, 'Config', fname)
+    fpath = os.path.join(OPENBENCH_CONFIG_DIR, 'Config', fname)
     if os.path.exists(fpath):
         with open(fpath) as fin:
             return { 'Authorization' : 'token %s' % fin.readlines()[0].rstrip() }

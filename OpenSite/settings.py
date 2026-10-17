@@ -36,6 +36,9 @@ PROJECT_PATH  = os.path.join(SETTINGS_DIR, os.pardir)
 PROJECT_PATH  = os.path.abspath(PROJECT_PATH)
 TEMPLATE_PATH = os.path.join(PROJECT_PATH, 'Templates')
 
+# Holds Config/, Books/ and Engines/; the smoke test points it at a temp directory
+OPENBENCH_CONFIG_DIR = os.environ.get('OPENBENCH_CONFIG_DIR', '') or PROJECT_PATH
+
 MEDIA_URL  = '/Media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'Media')
 
