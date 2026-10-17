@@ -10,6 +10,7 @@
 #   RESTORE                                the state it had before the delete
 #   APPROVE, MODIFY                        a report, state unchanged
 #   bench_error  (clientBenchError)        error
+#   backfill (report_to_nyayo)             one report, the test as it stands
 #   pgn      (clientSubmitPGN)             no match report; one PUT .../games/<result>.<book_index>.<n> per
 #                                          game in the batch, the game as uploaded plus Subject and Opponent
 #                                          tags, after the match exists in nyayo
@@ -28,10 +29,6 @@ COUNTS = ('games', 'wins', 'losses', 'draws', 'LL', 'LD', 'DD', 'DW', 'WW')
 # Scenarios that fail today, with the plan item that fixes each. The run passes while
 # they fail and fails when one starts passing: remove the mark in the commit that fixes it.
 XFAIL = {
-    '4' : "openbench-reports.md, What's wrong 1: a deleted test stays running",
-    '5' : "openbench-reports.md, What's wrong 1: its delete is reported running (fixed with 4)",
-    '6' : "openbench-reports.md, What's wrong 2: a bench mismatch is reported stopped, not error",
-    '7' : "openbench-reports.md, What's wrong 2: a stopped test that crashed is reported error",
 }
 
 
@@ -81,6 +78,8 @@ class Expectations:
             state  = previous
         elif kind == 'pgn':
             report, state = False, previous
+        elif kind == 'backfill':
+            state  = finished_state(after) or previous
         else:
             raise ValueError('no expectation for %s' % (kind))
 

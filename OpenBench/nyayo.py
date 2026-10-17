@@ -8,7 +8,7 @@ import requests
 from django.conf import settings
 from django.utils import timezone
 
-from OpenBench.models import Result, Test
+from OpenBench.models import LogEvent, Result, Test
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,29 @@ def nyayo_enabled():
 def build_match_id(test):
     instance = getattr(settings, 'NYAYO_INSTANCE', 'local')
     return 'openbench-%s-%s' % (instance, test.id)
+
+
+def stopped_by_bench_error(test):
+    # The test's newest bench error is newer than its newest action by hand (a restart, say).
+    # Only client_bench_error logs a worker's event without a log file; a worker's other
+    # errors (crashes, illegal moves) come with one, and may arrive after a stop by hand.
+    events   = LogEvent.objects.filter(test_id=test.id)
+    bench    = events.exclude(machine_id=0).filter(log_file='').order_by('-id').first()
+    by_hand  = events.filter(machine_id=0).order_by('-id').first()
+    return bench is not None and (by_hand is None or bench.id > by_hand.id)
+
+
+def match_state(test):
+    # (state, sprt.result), derived from the test every time (openbench-reports.md, The fixes)
+    if test.deleted:
+        return 'stopped', None
+    if test.finished and (test.passed or test.failed):
+        if test.test_mode != 'SPRT':
+            return 'finished', None
+        return 'finished', 'passed' if test.passed else 'failed'
+    if test.finished:
+        return ('error' if stopped_by_bench_error(test) else 'stopped'), None
+    return 'running', None
 
 
 def build_match_document(test, producer_url=None):
@@ -62,27 +85,8 @@ def build_match_document(test, producer_url=None):
         totals['crashes'] += row.crashes
         totals['timeloss'] += row.timeloss
 
-    if test.test_mode == 'SPRT':
-        kind = 'sprt'
-        if test.finished and test.passed:
-            state = 'finished'
-            sprt_result = 'passed'
-        elif test.finished and test.failed:
-            state = 'finished'
-            sprt_result = 'failed'
-        elif test.finished and not test.passed and not test.failed:
-            state = 'error' if test.error else 'stopped'
-            sprt_result = None
-        else:
-            state = 'running'
-            sprt_result = None
-    else:
-        kind = 'games'
-        if test.finished:
-            state = 'finished' if (test.passed or test.failed) else 'stopped'
-        else:
-            state = 'running'
-        sprt_result = None
+    kind = 'sprt' if test.test_mode == 'SPRT' else 'games'
+    state, sprt_result = match_state(test)
 
     document = {
         'schema_version': 1,
