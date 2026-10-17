@@ -408,6 +408,22 @@ class Harness:
         self.wait_for(lambda: uploaded() >= self.test_row(test_id)['games'], timeout,
                       'the worker to upload the games of test %d' % (test_id), soft=True)
 
+    def backfill(self, *args):
+        # manage.py report_to_nyayo, recording a backfill event for each test it sends
+        self.settle_all()
+        with self.lock:
+            ids = [x['id'] for x in self.query('SELECT id FROM OpenBench_test ORDER BY id')] if '--all' in args \
+                else [int(x) for x in args]
+            rows = { test_id : self.test_row(test_id) for test_id in ids }
+            output = self.manage('report_to_nyayo', *map(str, args), capture=True)
+            for test_id in ids:
+                self.expect.record(time.time(), 'backfill', test_id, rows[test_id], self.test_row(test_id))
+        return output
+
+    def settle_all(self):
+        for test_id in sorted({ x.test_id for x in self.expect.events }):
+            self.settle(test_id, timeout=5)
+
     def events(self, test_id, kind=None):
         return [x for x in self.expect.events if x.test_id == test_id and (kind is None or x.kind == kind)]
 
@@ -580,7 +596,7 @@ def scenario_bench_mismatch(h):
 
     check(h.test_row(test_id)['games'] == 0, 'games were played after a bench mismatch')
     h.verify(test_id)
-    return 'test %d: bench error, stopped' % (test_id)
+    return 'test %d: bench error, reported error' % (test_id)
 
 def scenario_crash_then_stop(h):
     # The dev exits after a few moves in every game; tight error bounds keep the SPRT open
@@ -653,6 +669,26 @@ def scenario_pgns(h):
         test_id, len(h.events(test_id, 'pgn')), len(h.nyayo.games_for_test(test_id)))
 
 
+def scenario_backfill(h):
+    test_id = h.create_test(test_mode='GAMES', max_games=8)
+    h.wait_for(lambda: h.test_row(test_id)['finished'], 90, 'test %d to finish' % (test_id))
+    h.verify(test_id)
+
+    # One test, as the live report would be; then --all, one report for every test there is
+    before = len(h.nyayo.reports)
+    h.backfill(test_id)
+    h.verify(test_id)
+    check(len(h.nyayo.reports) == before + 1, 'report_to_nyayo %d sent %d reports' % (test_id, len(h.nyayo.reports) - before))
+
+    tests  = len(h.query('SELECT id FROM OpenBench_test'))
+    before = len(h.nyayo.reports)
+    h.backfill('--all')
+    h.settle_all()
+    check(len(h.nyayo.reports) == before + tests, '--all sent %d reports for %d tests' % (len(h.nyayo.reports) - before, tests))
+    h.verify(test_id)
+    return 'test %d resent, then all %d tests' % (test_id, tests)
+
+
 SCENARIOS = collections.OrderedDict([
     ('1',  ('GAMES test to max_games',          scenario_games_to_max)),
     ('2',  ('SPRT with wide bounds to a result', scenario_sprt_to_result)),
@@ -664,11 +700,11 @@ SCENARIOS = collections.OrderedDict([
     ('8',  ('nyayo down for a while',            scenario_nyayo_down)),
     ('9',  ('no NYAYO_URL',                      scenario_no_nyayo)),
     ('10', ('every game reaches nyayo',          scenario_pgns)),
+    ('11', ('report_to_nyayo TEST_ID and --all',  scenario_backfill)),
 ])
 
 # Not written yet, each waiting on the work named
 PENDING = {
-    '11' : ('report_to_nyayo TEST_ID',           'the backfill command, openbench-reports.md'),
 }
 
 
