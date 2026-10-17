@@ -40,7 +40,7 @@ NYAYO_INSTANCE = 'smoke'
 CLIENT_TIMERS = { 'TIMEOUT_ERROR' : 1, 'TIMEOUT_WORKLOAD' : 1, 'REPORT_INTERVAL' : 2 }
 
 # Client requests that are events in expect.py
-WATCHED = { 'clientSubmitResults' : 'results', 'clientBenchError' : 'bench_error' }
+WATCHED = { 'clientSubmitResults' : 'results', 'clientBenchError' : 'bench_error', 'clientSubmitPGN' : 'pgn' }
 
 
 class SmokeFailure(Exception):
@@ -178,6 +178,17 @@ class NyayoServer:
         want = { name : final[name] for name in ('games', 'wins', 'draws', 'losses') }
         if len(rows) != 1 or rows[0] != want:
             problems.append('nyayo has results %s, the Test has %s' % (rows, want))
+        return problems
+
+    def check_games(self, match_id, count):
+        # nyayo indexed every game it took, with the subject's colour and the opponent known
+        rows = self.query('SELECT game, colour, opponent, result FROM matches_game WHERE match_id = ?', match_id)
+        problems = []
+        if len(rows) != count:
+            problems.append('nyayo has %d game(s) for the match, %d were sent' % (len(rows), count))
+        unknown = [x['game'] for x in rows if x['colour'] not in ('white', 'black') or not x['opponent']]
+        if unknown:
+            problems.append('nyayo could not place the players of %d game(s): %s' % (len(unknown), unknown[:5]))
         return problems
 
     def stop(self):
@@ -358,8 +369,11 @@ class Harness:
             response = forward()
             after    = self.test_row(test_id)
             if response.status_code == 200:
-                entry['event'] = self.expect.record(
-                    entry['t'], WATCHED[endpoint], test_id, before, after, lost=self.nyayo_down)
+                event = self.expect.record(entry['t'], WATCHED[endpoint], test_id, before, after, lost=self.nyayo_down)
+                if event.kind == 'pgn':
+                    event.upload     = entry.get('files', {}).get('file', b'')
+                    event.result_id  = entry['form']['result_id']
+                    event.book_index = entry['form']['book_index']
         return response
 
     def action(self, test_id, action, **fields):
@@ -400,6 +414,11 @@ class Harness:
         self.settle(test_id)
         problems = self.expect.check(
             test_id, self.nyayo.for_test(test_id), self.test_row(test_id), self.results(test_id))
+        problems += expect.check_games(
+            self.events(test_id), self.nyayo.games_for_test(test_id), self.nyayo.for_test(test_id))[0]
+        if self.nyayo_server:
+            problems += self.nyayo_server.check_games(
+                'openbench-%s-%d' % (NYAYO_INSTANCE, test_id), len(self.nyayo.games_for_test(test_id)))
         problems += ['nyayo recorder: %s %s: %s' % (x['method'], x['path'], x['problem']) for x in self.nyayo.violations]
         if self.nyayo_server and self.expect.expected(test_id):
             problems += self.nyayo_server.check_match('openbench-%s-%d' % (NYAYO_INSTANCE, test_id),
@@ -606,6 +625,20 @@ def scenario_no_nyayo(h):
         other.close(keep=h.args.keep)
 
 
+def scenario_pgns(h):
+    test_id = h.create_test(test_mode='GAMES', max_games=8, upload_pgns='COMPACT')
+    h.wait_for(lambda: h.test_row(test_id)['finished'], 90, 'test %d to finish' % (test_id))
+    h.wait_for(lambda: len(h.events(test_id, 'pgn')) * 4 >= h.test_row(test_id)['games'], 30,
+               'the worker to upload the PGNs of test %d' % (test_id))
+    _, want = expect.check_games(h.events(test_id), [], [])
+    h.wait_for(lambda: len(h.nyayo.games_for_test(test_id)) >= want, 15, '%d game(s) in nyayo' % (want), soft=True)
+
+    check(want == h.test_row(test_id)['games'], 'uploaded %d games, the test played %d' % (want, h.test_row(test_id)['games']))
+    h.verify(test_id)
+    return 'test %d: %d batches, %d games in nyayo' % (
+        test_id, len(h.events(test_id, 'pgn')), len(h.nyayo.games_for_test(test_id)))
+
+
 SCENARIOS = collections.OrderedDict([
     ('1',  ('GAMES test to max_games',          scenario_games_to_max)),
     ('2',  ('SPRT with wide bounds to a result', scenario_sprt_to_result)),
@@ -616,11 +649,11 @@ SCENARIOS = collections.OrderedDict([
     ('7',  ('engine crashes, then stopped',      scenario_crash_then_stop)),
     ('8',  ('nyayo down for a while',            scenario_nyayo_down)),
     ('9',  ('no NYAYO_URL',                      scenario_no_nyayo)),
+    ('10', ('upload_pgns=COMPACT reaches nyayo', scenario_pgns)),
 ])
 
 # Not written yet, each waiting on the work named
 PENDING = {
-    '10' : ('upload_pgns=COMPACT reaches nyayo', 'game-database.md'),
     '11' : ('report_to_nyayo TEST_ID',           'the backfill command, openbench-reports.md'),
 }
 

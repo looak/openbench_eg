@@ -33,7 +33,7 @@ from OpenBench.workloads.get_workload import get_workload
 from OpenBench.workloads.modify_workload import modify_workload
 from OpenBench.workloads.verify_workload import verify_workload
 from OpenBench.workloads.view_workload import view_workload
-from OpenBench.nyayo import enqueue_report
+from OpenBench.nyayo import enqueue_pgn, enqueue_report
 
 from OpenBench.config import OPENBENCH_CONFIG, OPENBENCH_CONFIG_CHECKSUM, OPENBENCH_STATIC_VERSION
 from OpenSite.settings import PROJECT_PATH
@@ -783,7 +783,11 @@ def client_submit_pgn(request, machine):
         pgn.save()
 
         # Save the .pgn.bz2 to /Media/
-        FileSystemStorage().save(pgn.filename(), ContentFile(request.FILES['file'].read()))
+        data = request.FILES['file'].read()
+        FileSystemStorage().save(pgn.filename(), ContentFile(data))
+
+        # The bytes go along: the PGN watcher may move the file into the tar first
+        transaction.on_commit(lambda: enqueue_pgn(pgn.test_id, pgn.result_id, pgn.book_index, data))
 
     return JsonResponse({})
 

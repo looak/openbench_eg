@@ -1,5 +1,7 @@
+import bz2
 import logging
 import queue
+import re
 import threading
 
 import requests
@@ -175,6 +177,92 @@ def enqueue_report(test_id):
     return True
 
 
+def enqueue_pgn(test_id, result_id, book_index, data):
+    # A worker's uploaded batch (.pgn.bz2), queued behind the match report of its results
+    if not nyayo_enabled():
+        return False
+    REPORT_QUEUE.put(('pgn', test_id, result_id, book_index, data))
+    return True
+
+
+def nyayo_opponent_id(name):
+    # The id nyayo gives the test's one opponent, from its name (nyayo/matches/ingest.py, safe_id)
+    text = re.sub(r'[^A-Za-z0-9._-]+', '-', str(name or '').strip()).strip('._-') or 'opponent-1'
+    if not text[0].isalnum():
+        text = 'x-%s' % (text)
+    return text[:64]
+
+
+def split_games(text):
+    # A stripped batch is "<headers>\n\n<moves>\n\n" per game (Client/pgn_util.py)
+    games, headers = [], None
+    for block in re.split(r'\n\s*\n', text.strip()):
+        block = block.strip()
+        if block.startswith('['):
+            headers = block
+        elif headers is not None and block:
+            games.append((headers, block))
+            headers = None
+    return games
+
+
+def tag_game(headers, moves, subject_colour, opponent):
+    # Which player is the engine under test: cutechess names them <engine>-dev and <engine>-base
+    tags = headers
+    if subject_colour:
+        tags += '\n[Subject "%s"]' % (subject_colour)
+    if opponent:
+        tags += '\n[Opponent "%s"]' % (opponent)
+    return '%s\n\n%s\n' % (tags, moves)
+
+
+def subject_colour(headers):
+    white = re.search(r'^\[White "([^"]*)"\]', headers, re.M)
+    black = re.search(r'^\[Black "([^"]*)"\]', headers, re.M)
+    if white and white.group(1).endswith('-dev'):
+        return 'white'
+    if black and black.group(1).endswith('-dev'):
+        return 'black'
+    return ''
+
+
+def report_pgn(test_id, result_id, book_index, data):
+    # Each finished game of the batch, PUT to /api/matches/<id>/games/<result>.<book_index>.<n>
+    if not nyayo_enabled():
+        return False
+
+    try:
+        test     = Test.objects.get(id=test_id)
+        match_id = build_match_id(test)
+        games    = split_games(bz2.decompress(data).decode('utf-8'))
+        opponent = nyayo_opponent_id(test.base.name)
+        headers  = {
+            'Authorization': 'Bearer %s' % settings.NYAYO_TOKEN,
+            'Content-Type': 'application/x-chess-pgn; charset=utf-8',
+        }
+    except Exception:
+        logger.exception('OpenBench failed to read the PGNs of test %s for nyayo', test_id)
+        return False
+
+    sent = 0
+    with requests.Session() as session:
+        for number, (tags, moves) in enumerate(games, 1):
+            game = '%d.%d.%d' % (result_id, book_index, number)
+            url  = '%s/api/matches/%s/games/%s' % (settings.NYAYO_URL.rstrip('/'), match_id, game)
+            body = tag_game(tags, moves, subject_colour(tags), opponent).encode('utf-8')
+            try:
+                response = session.put(url, data=body, headers=headers, timeout=5)
+                # nyayo doesn't know the match (it was down for its reports): send it, then the game again
+                if response.status_code == 404 and report_test(test_id):
+                    response = session.put(url, data=body, headers=headers, timeout=5)
+                response.raise_for_status()
+                sent += 1
+            except Exception:
+                logger.exception('OpenBench failed to report game %s of test %s to nyayo', game, test_id)
+
+    return sent == len(games)
+
+
 def report_test(test_id):
     if not nyayo_enabled():
         return False
@@ -202,12 +290,15 @@ def report_test(test_id):
 def _report_loop():
     while not REPORT_STOP.is_set():
         try:
-            test_id = REPORT_QUEUE.get(timeout=1)
+            item = REPORT_QUEUE.get(timeout=1)
         except queue.Empty:
             continue
 
         try:
-            report_test(test_id)
+            if isinstance(item, tuple) and item[0] == 'pgn':
+                report_pgn(*item[1:])
+            else:
+                report_test(item)
         finally:
             REPORT_QUEUE.task_done()
 

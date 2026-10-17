@@ -2,6 +2,8 @@
 # client.py and the server and logs what the worker said; the nyayo recorder
 # stands in for nyayo and logs every report the server's reporter sent.
 
+import email.parser
+import email.policy
 import json
 import re
 import threading
@@ -90,6 +92,8 @@ class ClientRecorder(Recorder):
 
         if ctype.startswith('application/x-www-form-urlencoded'):
             entry['form'] = { k : v[-1] for k, v in urllib.parse.parse_qs(body.decode()).items() }
+        elif ctype.startswith('multipart/form-data'):
+            entry['form'], entry['files'] = parse_multipart(ctype, body)
 
         def forward():
             response = requests.request(
@@ -114,6 +118,20 @@ class ClientRecorder(Recorder):
         with self.lock: self.log.append(entry)
         self.respond(handler, response.status_code, response.content,
                      response.headers.get('Content-Type', 'application/octet-stream'))
+
+
+def parse_multipart(ctype, body):
+    # (fields, files) of a multipart/form-data body, the way clientSubmitPGN sends its file
+    message = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+        b'Content-Type: ' + ctype.encode() + b'\r\n\r\n' + body)
+    fields, files = {}, {}
+    for part in message.iter_parts():
+        name = part.get_param('name', header='content-disposition')
+        if part.get_filename() is not None:
+            files[name] = part.get_payload(decode=True)
+        else:
+            fields[name] = part.get_payload(decode=True).decode()
+    return fields, files
 
 
 class NyayoRecorder(Recorder):

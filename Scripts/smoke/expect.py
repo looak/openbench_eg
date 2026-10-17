@@ -10,12 +10,18 @@
 #   RESTORE                                the state it had before the delete
 #   APPROVE, MODIFY                        a report, state unchanged
 #   bench_error  (clientBenchError)        error
+#   pgn      (clientSubmitPGN)             no match report; one PUT .../games/<result>.<book_index>.<n> per
+#                                          game in the batch, the game as uploaded plus Subject and Opponent
+#                                          tags, after the match exists in nyayo
 #
 # An event while nyayo is down has no report (lost); the next report carries the whole state.
 #
 # The states are openbench-reports.md's ("The fixes"), not what OpenBench/nyayo.py does today.
 
+import bz2
+import collections
 import math
+import re
 
 COUNTS = ('games', 'wins', 'losses', 'draws', 'LL', 'LD', 'DD', 'DW', 'WW')
 
@@ -72,6 +78,8 @@ class Expectations:
             state  = self.before_delete.pop(test_id, previous)
         elif kind in ('APPROVE', 'MODIFY'):
             state  = previous
+        elif kind == 'pgn':
+            report, state = False, previous
         else:
             raise ValueError('no expectation for %s' % (kind))
 
@@ -144,6 +152,56 @@ class Expectations:
                 problems.append('last report: %d crashes, the Results have %d' % (got, crashes))
 
         return problems
+
+
+def uploaded_games(event):
+    # The games of an uploaded batch, as {game id: text}, split on [Event independently of the server
+    text   = bz2.decompress(event.upload).decode('utf-8').strip()
+    chunks = [x.strip() for x in re.split(r'\n\s*\n(?=\[Event )', text) if x.strip()]
+    return { '%s.%s.%d' % (event.result_id, event.book_index, n) : chunk for n, chunk in enumerate(chunks, 1) }
+
+
+def normal(pgn):
+    return '\n'.join(line.rstrip() for line in pgn.strip().splitlines() if line.strip())
+
+
+def check_games(events, games, reports):
+    # Every uploaded game reached nyayo once, unchanged but for the two tags, after its match
+
+    problems, want = [], {}
+    for event in events:
+        if event.kind == 'pgn':
+            want.update(uploaded_games(event))
+
+    got     = collections.Counter(x['game'] for x in games)
+    missing = sorted(set(want) - set(got))
+    extra   = sorted(set(got) - set(want))
+    twice   = sorted(x for x, count in got.items() if count > 1)
+    if missing: problems.append('%d uploaded game(s) never reached nyayo: %s' % (len(missing), missing[:5]))
+    if extra:   problems.append('%d game(s) nobody uploaded: %s' % (len(extra), extra[:5]))
+    if twice:   problems.append('game(s) sent more than once: %s' % (twice[:5]))
+
+    first_report = min((x['t'] for x in reports), default=None)
+    for sent in games:
+        if sent['game'] not in want:
+            continue
+        where = 'game %s' % (sent['game'])
+        pgn   = sent['pgn']
+        tags  = dict(re.findall(r'^\[(Subject|Opponent) "([^"]*)"\]$', pgn, re.M))
+        bare  = re.sub(r'^\[(Subject|Opponent) "[^"]*"\]\n', '', pgn, flags=re.M)
+
+        if normal(bare) != normal(want[sent['game']]):
+            problems.append('%s: differs from the uploaded game' % (where))
+        white  = re.search(r'^\[White "([^"]*)"\]', pgn, re.M)
+        colour = 'white' if white and white.group(1).endswith('-dev') else 'black'
+        if tags.get('Subject') != colour:
+            problems.append('%s: Subject %r, the dev engine plays %s' % (where, tags.get('Subject'), colour))
+        if not tags.get('Opponent'):
+            problems.append('%s: no Opponent tag' % (where))
+        if first_report is None or sent['t'] < first_report:
+            problems.append('%s: sent before its match' % (where))
+
+    return problems, len(want)
 
 
 def document_counts(doc):
