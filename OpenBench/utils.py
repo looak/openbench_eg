@@ -480,8 +480,6 @@ def update_test(request, machine):
 
         test.save()
 
-    transaction.on_commit(lambda: enqueue_report(test.id))
-
     # Update Result object; No risk from concurrent access
     Result.objects.filter(id=result_id).update(
         games    = F('games'   ) + games,
@@ -508,5 +506,8 @@ def update_test(request, machine):
     Machine.objects.filter(id=machine_id).update(
         updated=timezone.now()
     )
+
+    # Reported once the Result is updated too: the report's counts are the Result rows' sums
+    transaction.on_commit(lambda: enqueue_report(test.id))
 
     return [{}, { 'stop' : True }][test.finished]
