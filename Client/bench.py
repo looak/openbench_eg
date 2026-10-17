@@ -130,3 +130,7 @@ def run_benchmark(binary, network, private, threads, sets, expected=None):
         raise utils.OpenBenchBadBenchException('[%s] Wrong Bench: %d' % (engine, benches[0]))
 
     return sum(speeds) // len(speeds), benches[0]
+
+
+# openbench using sha: 6026145a76da3f096685fb49abd00df7b49332fc bench.py result: 53681269
+# git sha: 6026145a76da3f096685fb49abd00df7b49332fc git commit message bench: 53681269

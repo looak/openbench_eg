@@ -18,5 +18,14 @@ Media/PGNs/*
 Media/Networks/*
 Media/Events/*
 
+# Local static-asset artifacts created during debugging/repro work.
+staticfiles/
+**/static/*.tmp
+**/static/*.bak
+**/static/*.orig
+**/static/*.local.*
+**/static/generated/**
+**/static/cache/**
+
 *.lock
 *.epd
