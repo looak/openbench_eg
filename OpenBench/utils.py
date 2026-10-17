@@ -136,6 +136,10 @@ def workload_uses_time_based_tc(workload):
        or (base_type != TimeControl.FIXED_NODES and base_type != TimeControl.FIXED_DEPTH)
 
 
+def always_upload(upload_pgns):
+    # The fork keeps every game for training, so FALSE (upstream's default) becomes COMPACT
+    return 'COMPACT' if upload_pgns == 'FALSE' else upload_pgns
+
 def read_git_credentials(engine):
     fname = 'credentials.%s' % (engine.replace(' ', '').lower())
     fpath = os.path.join(OPENBENCH_CONFIG_DIR, 'Config', fname)

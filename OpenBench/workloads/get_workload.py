@@ -194,6 +194,11 @@ def workload_to_dictionary(test, result, machine):
         test.scale_nps = OPENBENCH_CONFIG['engines'][test.base_engine]['nps']
         test.save()
 
+    # Every game is kept (nyayo's game database), including those of tests made before that
+    if test.upload_pgns == 'FALSE':
+        test.upload_pgns = OpenBench.utils.always_upload(test.upload_pgns)
+        test.save()
+
     workload = {}
 
     workload['result'] = {
