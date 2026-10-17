@@ -550,11 +550,13 @@ class Cutechess:
     @staticmethod
     def pgn_name(config, timestamp, cutechess_idx):
 
-        test_id   = int(config.workload['test']['id'])
-        result_id = int(config.workload['result']['id'])
+        test_id    = int(config.workload['test']['id'])
+        result_id  = int(config.workload['result']['id'])
+        book_index = int(config.workload['test']['book_index'])
 
-        # Format: <Test>-<Result>-<Time>-<Index>.pgn
-        return 'PGNs/%d.%d.%d.%d.pgn' % (test_id, result_id, timestamp, cutechess_idx)
+        # Format: <Test>-<Result>-<BookIndex>-<Time>-<Index>.pgn. The book index is new for every
+        # workload, so two in the same second can't share a file (cutechess appends to it)
+        return 'PGNs/%d.%d.%d.%d.%d.pgn' % (test_id, result_id, book_index, timestamp, cutechess_idx)
 
 
 class PGNHelper:
