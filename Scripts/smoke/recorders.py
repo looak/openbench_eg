@@ -35,8 +35,9 @@ class Recorder:
     def start(self):
         recorder = self
 
+        # HTTP/1.0, a connection per request: taking a recorder down must leave no
+        # keep-alive connection still being served
         class Handler(BaseHTTPRequestHandler):
-            protocol_version = 'HTTP/1.1'
 
             def do_GET(self):  recorder.handle(self, 'GET')
             def do_POST(self): recorder.handle(self, 'POST')

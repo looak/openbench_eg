@@ -374,6 +374,7 @@ class Harness:
                     event.upload     = entry.get('files', {}).get('file', b'')
                     event.result_id  = entry['form']['result_id']
                     event.book_index = entry['form']['book_index']
+                    event.lost       = self.nyayo_down  # Nothing resends a batch nyayo missed, yet
         return response
 
     def action(self, test_id, action, **fields):
@@ -396,7 +397,16 @@ class Harness:
         want = lambda: len(self.expect.expected(test_id))
         self.wait_for(lambda: len(self.nyayo.for_test(test_id)) >= want(), timeout,
                       '%d report(s) for test %d' % (want(), test_id), soft=True)
+        games = lambda: expect.check_games(self.events(test_id), [], [])[1]
+        self.wait_for(lambda: len(self.nyayo.games_for_test(test_id)) >= games(), timeout,
+                      '%d game(s) of test %d' % (games(), test_id), soft=True)
         time.sleep(0.3)
+
+    def wait_for_uploads(self, test_id, timeout=20):
+        # The worker uploads a workload's PGNs after its last results, so after the test may have ended
+        uploaded = lambda: sum(len(expect.uploaded_games(x)) for x in self.events(test_id, 'pgn'))
+        self.wait_for(lambda: uploaded() >= self.test_row(test_id)['games'], timeout,
+                      'the worker to upload the games of test %d' % (test_id), soft=True)
 
     def events(self, test_id, kind=None):
         return [x for x in self.expect.events if x.test_id == test_id and (kind is None or x.kind == kind)]
@@ -411,6 +421,7 @@ class Harness:
                       timeout, 'the worker to leave test %d' % (test_id))
 
     def verify(self, test_id):
+        self.wait_for_uploads(test_id)
         self.settle(test_id)
         problems = self.expect.check(
             test_id, self.nyayo.for_test(test_id), self.test_row(test_id), self.results(test_id))
@@ -439,6 +450,10 @@ class Harness:
             worker, count = re.subn(r'^(%s\s*=\s*)\d+' % (name), r'\g<1>%d' % (value), worker, flags=re.M)
             if count != 1:
                 raise SmokeFailure('worker.py has no %s to shorten' % (name))
+        # The worker drains its results queue with a fixed 5 s wait, once more after every workload
+        worker, count = re.subn(r'results_queue\.get\(timeout=5\)', 'results_queue.get(timeout=0.5)', worker)
+        if count != 1:
+            raise SmokeFailure('worker.py has no results_queue wait to shorten')
         (client / 'worker.py').write_text(worker)
 
         env = os.environ.copy()
@@ -586,7 +601,7 @@ def scenario_nyayo_down(h):
     with h.lock:
         h.nyayo_down = True
         h.nyayo.stop()
-    h.wait_for(lambda: any(not x.report for x in h.events(test_id)), 60, 'a batch while nyayo is down')
+    h.wait_for(lambda: any(x.lost for x in h.events(test_id, 'results')), 60, 'a batch while nyayo is down')
     lost_at = len(h.recorder.log)
     time.sleep(1)  # Let the reporter fail on it
 
@@ -626,15 +641,14 @@ def scenario_no_nyayo(h):
 
 
 def scenario_pgns(h):
-    test_id = h.create_test(test_mode='GAMES', max_games=8, upload_pgns='COMPACT')
+    # Made with upstream's default, FALSE: the fork uploads every test's games anyway
+    test_id = h.create_test(test_mode='GAMES', max_games=8, upload_pgns='FALSE')
     h.wait_for(lambda: h.test_row(test_id)['finished'], 90, 'test %d to finish' % (test_id))
-    h.wait_for(lambda: len(h.events(test_id, 'pgn')) * 4 >= h.test_row(test_id)['games'], 30,
-               'the worker to upload the PGNs of test %d' % (test_id))
-    _, want = expect.check_games(h.events(test_id), [], [])
-    h.wait_for(lambda: len(h.nyayo.games_for_test(test_id)) >= want, 15, '%d game(s) in nyayo' % (want), soft=True)
-
-    check(want == h.test_row(test_id)['games'], 'uploaded %d games, the test played %d' % (want, h.test_row(test_id)['games']))
     h.verify(test_id)
+
+    want = expect.check_games(h.events(test_id), [], [])[1]
+    check(h.test_row(test_id)['upload_pgns'] == 'COMPACT', 'upload_pgns is %r' % (h.test_row(test_id)['upload_pgns']))
+    check(want == h.test_row(test_id)['games'], 'uploaded %d games, the test played %d' % (want, h.test_row(test_id)['games']))
     return 'test %d: %d batches, %d games in nyayo' % (
         test_id, len(h.events(test_id, 'pgn')), len(h.nyayo.games_for_test(test_id)))
 
@@ -649,7 +663,7 @@ SCENARIOS = collections.OrderedDict([
     ('7',  ('engine crashes, then stopped',      scenario_crash_then_stop)),
     ('8',  ('nyayo down for a while',            scenario_nyayo_down)),
     ('9',  ('no NYAYO_URL',                      scenario_no_nyayo)),
-    ('10', ('upload_pgns=COMPACT reaches nyayo', scenario_pgns)),
+    ('10', ('every game reaches nyayo',          scenario_pgns)),
 ])
 
 # Not written yet, each waiting on the work named

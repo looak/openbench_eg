@@ -43,7 +43,8 @@ class Event:
         self.report, self.state = report, state
 
     def __repr__(self):
-        return '%s(test %d -> %s)' % (self.kind, self.test_id, self.state if self.report else 'no report')
+        outcome = self.state if self.report else ('%s, if it arrives' % (self.state) if self.lost else 'no report')
+        return '%s(test %d at %s games -> %s)' % (self.kind, self.test_id, self.after['games'], outcome)
 
 
 def finished_state(row):
@@ -97,16 +98,34 @@ class Expectations:
         # Returns the problems found: nothing missing, nothing extra, always consistent
 
         problems = []
-        expected = self.expected(test_id)
         match_id = 'openbench-%s-%d' % (self.instance, test_id)
 
-        if len(reports) < len(expected):
-            missing = expected[len(reports):]
-            problems.append('missing %d report(s), for %s' % (len(missing), missing))
-        if len(reports) > len(expected):
-            problems.append('%d report(s) no event explains' % (len(reports) - len(expected)))
+        # An event while nyayo was down may still have its report arrive: the reporter sends
+        # from its queue after the event, maybe once nyayo is back. Such a report is optional,
+        # so reports are aligned to events, skipping optional events they don't match.
+        events = [x for x in self.events if x.test_id == test_id and x.kind != 'pgn' and (x.report or x.lost)]
+        pairs, extra, position = [], 0, 0
+        for report in reports:
+            index = position
+            while index < len(events) and events[index].lost and not matches(events[index], report):
+                index += 1
+            if index == len(events):
+                extra += 1
+                continue
+            pairs.append((events[index], report))
+            position = index + 1
 
-        for index, (event, report) in enumerate(zip(expected, reports)):
+        missing = [x for x in events[position:] if not x.lost]
+        if missing:
+            problems.append('missing %d report(s), for %s' % (len(missing), missing))
+        if extra:
+            problems.append('%d report(s) no event explains' % (extra))
+        if problems or any(x.lost for x in events):
+            problems_detail = 'events: %s' % (events)
+        else:
+            problems_detail = None
+
+        for index, (event, report) in enumerate(pairs):
             doc, where = report['document'], 'report %d (after %s)' % (index + 1, event.kind)
 
             if doc.get('id') != match_id:
@@ -151,6 +170,8 @@ class Expectations:
             if got != crashes:
                 problems.append('last report: %d crashes, the Results have %d' % (got, crashes))
 
+        if problems and problems_detail:
+            problems.append(problems_detail)
         return problems
 
 
@@ -168,13 +189,19 @@ def normal(pgn):
 def check_games(events, games, reports):
     # Every uploaded game reached nyayo once, unchanged but for the two tags, after its match
 
-    problems, want = [], {}
+    # Returns (problems, how many games must have arrived); a batch uploaded while nyayo was
+    # down may be missing, since nothing resends it yet
+
+    problems, want, optional = [], {}, set()
     for event in events:
         if event.kind == 'pgn':
-            want.update(uploaded_games(event))
+            batch = uploaded_games(event)
+            want.update(batch)
+            if event.lost:
+                optional.update(batch)
 
     got     = collections.Counter(x['game'] for x in games)
-    missing = sorted(set(want) - set(got))
+    missing = sorted(set(want) - set(got) - optional)
     extra   = sorted(set(got) - set(want))
     twice   = sorted(x for x, count in got.items() if count > 1)
     if missing: problems.append('%d uploaded game(s) never reached nyayo: %s' % (len(missing), missing[:5]))
@@ -201,7 +228,14 @@ def check_games(events, games, reports):
         if first_report is None or sent['t'] < first_report:
             problems.append('%s: sent before its match' % (where))
 
-    return problems, len(want)
+    return problems, len(set(want) - optional)
+
+
+def matches(event, report):
+    doc = report['document']
+    if doc.get('state') != event.state:
+        return False
+    return event.kind != 'results' or document_counts(doc) == { name : event.after[name] for name in COUNTS }
 
 
 def document_counts(doc):
