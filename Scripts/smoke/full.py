@@ -102,12 +102,94 @@ def find_free_port():
         return sock.getsockname()[1]
 
 
+class NyayoServer:
+
+    # A real nyayo from a checkout (--nyayo PATH), its data in a temp directory, and a
+    # machine token for the reporter. The nyayo recorder forwards to it.
+
+    def __init__(self, checkout, python, temp):
+        self.checkout = Path(checkout).resolve()
+        self.python   = python
+        self.data     = temp / 'nyayo'
+        self.port     = find_free_port()
+        self.url      = 'http://127.0.0.1:%d' % (self.port)
+        self.proc     = self.log = None
+
+        if not (self.checkout / 'manage.py').is_file() or not (self.checkout / 'nyayo').is_dir():
+            raise SmokeFailure('%s is not a nyayo checkout' % (self.checkout))
+
+        # Set explicitly, so nyayo's own .env (python-dotenv never overrides) can't point it at real data
+        self.env = { k : v for k, v in os.environ.items() if not k.startswith('NYAYO_') }
+        self.env.update({
+            'NYAYO_DATA_DIR'      : str(self.data),
+            'NYAYO_DEBUG'         : '1',
+            'NYAYO_SECRET_KEY'    : 'openbench-smoke',
+            'NYAYO_ALLOWED_HOSTS' : '127.0.0.1,localhost',
+        })
+
+    def manage(self, *args):
+        result = subprocess.run([self.python, 'manage.py'] + list(args), cwd=self.checkout, env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if result.returncode:
+            raise SmokeFailure('nyayo manage.py %s failed\n%s' % (args[0], result.stdout))
+        return result.stdout
+
+    def start(self):
+        self.data.mkdir(parents=True)
+        self.manage('migrate', '--noinput')
+        self.manage('shell', '-c', (
+            'from nyayo.runs.models import Machine; '
+            'Machine.objects.create(name="openbench-smoke", token_hash=Machine.hash_token(%r))') % (NYAYO_TOKEN))
+
+        self.proc = subprocess.Popen(
+            [self.python, '-u', 'manage.py', 'runserver', '127.0.0.1:%d' % (self.port), '--noreload'],
+            cwd=self.checkout, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.log = LogTail(self.proc.stdout, self.data.parent / 'nyayo.log')
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise SmokeFailure('nyayo exited\n%s' % (self.log.tail()))
+            try:
+                if requests.get(self.url + '/matches', timeout=2).status_code == 200:
+                    return self
+            except requests.RequestException:
+                pass
+            time.sleep(0.25)
+        raise SmokeFailure('nyayo did not start\n%s' % (self.log.tail()))
+
+    def query(self, sql, *params):
+        db = sqlite3.connect('file:%s?mode=ro' % (self.data / 'nyayo.sqlite3'), uri=True, timeout=10)
+        try:
+            db.row_factory = sqlite3.Row
+            return [dict(row) for row in db.execute(sql, params)]
+        finally:
+            db.close()
+
+    def check_match(self, match_id, state, final):
+        # nyayo's own record of the match agrees with OpenBench's Test row
+        matches = self.query('SELECT state FROM matches_match WHERE id = ?', match_id)
+        if not matches:
+            return ['nyayo has no match %s' % (match_id)]
+        problems = []
+        if matches[0]['state'] != state:
+            problems.append('nyayo has the match %s, expected %s' % (matches[0]['state'], state))
+        rows = self.query('SELECT games, wins, draws, losses FROM matches_matchresult WHERE match_id = ?', match_id)
+        want = { name : final[name] for name in ('games', 'wins', 'draws', 'losses') }
+        if len(rows) != 1 or rows[0] != want:
+            problems.append('nyayo has results %s, the Test has %s' % (rows, want))
+        return problems
+
+    def stop(self):
+        stop_process(self.proc)
+
+
 class Harness:
 
     # One server, one client, the recorders between them. With nyayo=False the server
     # gets no NYAYO_* settings, and the nyayo recorder only listens.
 
-    def __init__(self, args, file_server, name='main', nyayo=True):
+    def __init__(self, args, file_server, name='main', nyayo=True, nyayo_server=None):
         self.args   = args
         self.files  = file_server
         self.name   = name
@@ -121,7 +203,8 @@ class Harness:
         self.lock       = threading.Lock()  # Orders events: recorded client requests and actions by hand
         self.expect     = expect.Expectations(NYAYO_INSTANCE)
         self.nyayo_down = False
-        self.nyayo      = NyayoRecorder(NYAYO_TOKEN, NYAYO_INSTANCE).start()
+        self.nyayo_server = nyayo_server
+        self.nyayo      = NyayoRecorder(NYAYO_TOKEN, NYAYO_INSTANCE, nyayo_server and nyayo_server.url).start()
         self.recorder   = ClientRecorder(self.url, self.on_client_event, WATCHED).start()
 
         self.env = os.environ.copy()
@@ -318,6 +401,9 @@ class Harness:
         problems = self.expect.check(
             test_id, self.nyayo.for_test(test_id), self.test_row(test_id), self.results(test_id))
         problems += ['nyayo recorder: %s %s: %s' % (x['method'], x['path'], x['problem']) for x in self.nyayo.violations]
+        if self.nyayo_server and self.expect.expected(test_id):
+            problems += self.nyayo_server.check_match('openbench-%s-%d' % (NYAYO_INSTANCE, test_id),
+                                                      self.expect.state[test_id], self.test_row(test_id))
         if problems:
             raise SmokeFailure('test %d:\n  - %s\n\n%s' % (test_id, '\n  - '.join(problems), expect.timeline(
                 test_id, list(self.recorder.log), self.expect.events, self.nyayo.for_test(test_id))))
@@ -572,10 +658,13 @@ def main(args):
     if unknown:
         raise SmokeFailure('unknown scenario(s): %s' % (', '.join(unknown)))
 
-    started, failed = time.time(), []
+    started, failed, nyayo = time.time(), [], None
     with files.FileServer() as file_server:
         harness = Harness(args, file_server)
         try:
+            if args.nyayo:
+                nyayo = NyayoServer(args.nyayo, args.nyayo_python or sys.executable, harness.temp).start()
+                harness.nyayo.target, harness.nyayo_server = nyayo.url, nyayo
             harness.start_server()
             harness.start_client()
 
@@ -593,6 +682,9 @@ def main(args):
             raise
 
         finally:
+            if nyayo:
+                if failed: print('\n---- nyayo log (tail; full log in %s) ----\n%s' % (nyayo.log.path, nyayo.log.tail()))
+                nyayo.stop()
             harness.close(keep=args.keep or bool(failed))
 
     print('\nSMOKE FULL %s in %.1fs' % ('FAIL (%s)' % (', '.join(failed)) if failed else 'PASS', time.time() - started))

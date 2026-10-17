@@ -118,14 +118,21 @@ class ClientRecorder(Recorder):
 
 class NyayoRecorder(Recorder):
 
-    # Answers like nyayo, 201 for a new match and 200 after, and keeps every document.
-    # Anything but an authorised PUT /api/matches/openbench-<instance>-<id> is a violation.
+    # Stands in for nyayo. Without a target it answers like nyayo, 201 for a new match or
+    # game and 200 after; with one (a real nyayo) it forwards and passes nyayo's answer
+    # back, and any answer but 200 or 201 is a violation carrying nyayo's reason. Only an
+    # authorised PUT of a match or of one of its games is allowed:
+    #   /api/matches/openbench-<instance>-<test id>               the match document, JSON
+    #   /api/matches/openbench-<instance>-<test id>/games/<game>  one game's PGN
 
-    def __init__(self, token, instance):
+    def __init__(self, token, instance, target=None):
         super().__init__('smoke-nyayo-recorder')
         self.token      = token
-        self.pattern    = re.compile(r'^/api/matches/(openbench-%s-(\d+))$' % (re.escape(instance)))
+        self.target     = target
+        self.pattern    = re.compile(r'^/api/matches/(openbench-%s-(\d+))(?:/games/([A-Za-z0-9][A-Za-z0-9._-]{0,63}))?$'
+                                     % (re.escape(instance)))
         self.reports    = []
+        self.games      = []
         self.violations = []
         self.seen       = set()
 
@@ -134,34 +141,62 @@ class NyayoRecorder(Recorder):
         path  = handler.path
         match = self.pattern.match(path)
         auth  = handler.headers.get('Authorization', '')
+        game  = match and match.group(3)
 
-        problem = None
+        problem, document = None, None
         if method != 'PUT':
             problem = '%s instead of PUT' % (method)
         elif not match:
             problem = 'unknown path'
         elif auth != 'Bearer %s' % (self.token):
             problem = 'bad Authorization header %r' % (auth)
+        elif game:
+            if not handler.headers.get('Content-Type', '').startswith('application/x-chess-pgn'):
+                problem = 'a game sent as %r' % (handler.headers.get('Content-Type'))
+        else:
+            try:
+                document = json.loads(body.decode() or 'null')
+            except ValueError:
+                problem = 'body is not JSON'
+            if not problem and (not isinstance(document, dict) or document.get('id') != match.group(1)):
+                problem = 'document id does not match the path'
 
-        try:
-            document = json.loads(body.decode() or 'null')
-        except ValueError:
-            document, problem = None, problem or 'body is not JSON'
+        if problem:
+            with self.lock:
+                self.violations.append({ 't' : time.time(), 'method' : method, 'path' : path, 'problem' : problem })
+            return self.respond(handler, 400, json.dumps({ 'error' : problem }).encode())
 
-        if not problem and (not isinstance(document, dict) or document.get('id') != match.group(1)):
-            problem = 'document id does not match the path'
+        key = (match.group(1), game)
+        if self.target:
+            try:
+                upstream = requests.put(self.target + path, data=body, timeout=10, headers={
+                    name : handler.headers[name] for name in ('Authorization', 'Content-Type', 'Content-Encoding')
+                    if handler.headers.get(name) })
+                status, reply = upstream.status_code, upstream.content
+            except requests.RequestException as error:
+                status, reply = 502, str(error).encode()
+        else:
+            with self.lock:
+                status = 200 if key in self.seen else 201
+                self.seen.add(key)
+            reply = json.dumps({ 'id' : match.group(1) }).encode()
 
         with self.lock:
-            if problem:
-                self.violations.append({ 't' : time.time(), 'method' : method, 'path' : path, 'problem' : problem })
-                return self.respond(handler, 400, json.dumps({ 'error' : problem }).encode())
+            entry = { 't' : time.time(), 'test_id' : int(match.group(2)), 'status' : status }
+            if status not in (200, 201):
+                self.violations.append({ 't' : entry['t'], 'method' : method, 'path' : path,
+                                         'problem' : 'nyayo answered %d: %s' % (status, reply.decode(errors='replace')[:300]) })
+            if game:
+                self.games.append({ **entry, 'game' : game, 'pgn' : body.decode(errors='replace') })
+            else:
+                self.reports.append({ **entry, 'document' : document })
 
-            status = 200 if match.group(1) in self.seen else 201
-            self.seen.add(match.group(1))
-            self.reports.append({ 't' : time.time(), 'test_id' : int(match.group(2)), 'document' : document, 'status' : status })
-
-        self.respond(handler, status, json.dumps({ 'id' : match.group(1) }).encode())
+        self.respond(handler, status, reply, 'text/plain; charset=utf-8')
 
     def for_test(self, test_id):
         with self.lock:
             return [x for x in self.reports if x['test_id'] == test_id]
+
+    def games_for_test(self, test_id):
+        with self.lock:
+            return [x for x in self.games if x['test_id'] == test_id]
