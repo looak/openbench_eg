@@ -26,10 +26,18 @@ import re
 
 COUNTS = ('games', 'wins', 'losses', 'draws', 'LL', 'LD', 'DD', 'DW', 'WW')
 
-# Scenarios that fail today, with the plan item that fixes each. The run passes while
-# they fail and fails when one starts passing: remove the mark in the commit that fixes it.
+# Scenarios that fail today, with the plan item that fixes each and the runs it applies to.
+# The run passes while they fail and fails when one starts passing: remove the mark in the
+# commit that fixes it.
+WITH_NYAYO = lambda args: bool(args.nyayo)
+V1_NYAYO   = lambda args: bool(args.nyayo) and args.schema == 'v1'
 XFAIL = {
 }
+
+
+def xfail(key, args):
+    reason, applies = XFAIL.get(key, (None, None))
+    return reason if reason and applies(args) else None
 
 
 class Event:
@@ -78,7 +86,7 @@ class Expectations:
             state  = previous
         elif kind == 'pgn':
             report, state = False, previous
-        elif kind == 'backfill':
+        elif kind in ('backfill', 'backfill-v1'):
             state  = finished_state(after) or previous
         else:
             raise ValueError('no expectation for %s' % (kind))
@@ -93,7 +101,7 @@ class Expectations:
     def expected(self, test_id):
         return [x for x in self.events if x.test_id == test_id and x.report]
 
-    def check(self, test_id, reports, final, results):
+    def check(self, test_id, reports, final, results, engines=None):
         # Returns the problems found: nothing missing, nothing extra, always consistent
 
         problems = []
@@ -125,47 +133,50 @@ class Expectations:
             problems_detail = None
 
         for index, (event, report) in enumerate(pairs):
-            doc, where = report['document'], 'report %d (after %s)' % (index + 1, event.kind)
+            doc, where = view(report['document']), 'report %d (after %s)' % (index + 1, event.kind)
 
-            if doc.get('id') != match_id:
-                problems.append('%s: id %r, expected %r' % (where, doc.get('id'), match_id))
-            if doc.get('state') != event.state:
-                problems.append('%s: state %r, expected %r' % (where, doc.get('state'), event.state))
-            if doc.get('kind') != ('sprt' if final['test_mode'] == 'SPRT' else 'games'):
-                problems.append('%s: kind %r for a %s test' % (where, doc.get('kind'), final['test_mode']))
+            if doc['id'] != match_id:
+                problems.append('%s: id %r, expected %r' % (where, doc['id'], match_id))
+            if doc['state'] != event.state:
+                problems.append('%s: state %r, expected %r' % (where, doc['state'], event.state))
+            if doc['kind'] != ('sprt' if final['test_mode'] == 'SPRT' else 'games'):
+                problems.append('%s: kind %r for a %s test' % (where, doc['kind'], final['test_mode']))
+            if event.kind == 'backfill-v1' and not doc['v1']:
+                problems.append('%s: not a version 1 document' % (where))
 
-            if event.kind == 'results':
-                got = document_counts(doc)
+            if event.kind in ('results', 'backfill', 'backfill-v1'):
                 want = { name : event.after[name] for name in COUNTS }
-                if got != want:
-                    problems.append('%s: counts %s, the Test had %s' % (where, got, want))
+                if doc['counts'] != want:
+                    problems.append('%s: counts %s, the Test had %s' % (where, doc['counts'], want))
 
                 if final['test_mode'] == 'SPRT':
-                    llr = (doc.get('sprt') or {}).get('current_llr')
+                    llr = doc['llr']
                     if llr is None or not math.isclose(llr, event.after['currentllr'], abs_tol=1e-9):
                         problems.append('%s: LLR %r, the Test had %r' % (where, llr, event.after['currentllr']))
 
+                if doc['v1']:
+                    problems += ['%s: %s' % (where, x) for x in check_v1(report['document'], event.after, engines)]
+
             if final['test_mode'] == 'SPRT' and event.state == 'finished':
                 want = 'passed' if event.after['passed'] else 'failed'
-                got  = (doc.get('sprt') or {}).get('result')
-                if got != want:
-                    problems.append('%s: sprt.result %r, expected %r' % (where, got, want))
+                if doc['sprt_result'] != want:
+                    problems.append('%s: sprt.result %r, expected %r' % (where, doc['sprt_result'], want))
 
         # Counts never go down
         for index, (older, newer) in enumerate(zip(reports, reports[1:])):
-            old, new = document_counts(older['document']), document_counts(newer['document'])
+            old, new = view(older['document'])['counts'], view(newer['document'])['counts']
             fallen = [name for name in COUNTS if new[name] < old[name]]
             if fallen:
                 problems.append('report %d: %s went down' % (index + 2, ', '.join(fallen)))
 
         # The last report agrees with OpenBench's Test row
         if reports:
-            doc  = reports[-1]['document']
+            doc  = view(reports[-1]['document'])
             want = { name : final[name] for name in COUNTS }
-            if document_counts(doc) != want:
-                problems.append('last report: counts %s, the Test has %s' % (document_counts(doc), want))
+            if doc['counts'] != want:
+                problems.append('last report: counts %s, the Test has %s' % (doc['counts'], want))
             crashes = sum(row['crashes'] for row in results)
-            got     = sum(row.get('crashes', 0) for row in doc.get('results', []))
+            got     = doc['crashes']
             if got != crashes:
                 problems.append('last report: %d crashes, the Results have %d' % (got, crashes))
 
@@ -185,7 +196,7 @@ def normal(pgn):
     return '\n'.join(line.rstrip() for line in pgn.strip().splitlines() if line.strip())
 
 
-def check_games(events, games, reports):
+def check_games(events, games, reports, names=None):
     # Every uploaded game reached nyayo once, unchanged but for the two tags, after its match
 
     # Returns (problems, how many games must have arrived); a batch uploaded while nyayo was
@@ -213,16 +224,25 @@ def check_games(events, games, reports):
             continue
         where = 'game %s' % (sent['game'])
         pgn   = sent['pgn']
-        tags  = dict(re.findall(r'^\[(Subject|Opponent) "([^"]*)"\]$', pgn, re.M))
+        tags  = dict(re.findall(r'^\[(Subject|Opponent|White|Black) "([^"]*)"\]$', pgn, re.M))
         bare  = re.sub(r'^\[(Subject|Opponent) "[^"]*"\]\n', '', pgn, flags=re.M)
+        sent_ = dict(re.findall(r'^\[(White|Black) "([^"]*)"\]$', want[sent['game']], re.M))
+        players = lambda text: re.sub(r'^\[(White|Black) "[^"]*"\]$', '', text, flags=re.M)
 
-        if normal(bare) != normal(want[sent['game']]):
+        # The game as uploaded, but for the tags and, under v1, the players' names
+        if normal(players(bare) if names else bare) != normal(players(want[sent['game']]) if names else want[sent['game']]):
             problems.append('%s: differs from the uploaded game' % (where))
-        white  = re.search(r'^\[White "([^"]*)"\]', pgn, re.M)
-        colour = 'white' if white and white.group(1).endswith('-dev') else 'black'
+        colour = 'white' if sent_.get('White', '').endswith('-dev') else 'black'
         if tags.get('Subject') != colour:
             problems.append('%s: Subject %r, the dev engine plays %s' % (where, tags.get('Subject'), colour))
-        if not tags.get('Opponent'):
+        if names:
+            dev, base = names
+            want_names = { 'White' : dev, 'Black' : base } if colour == 'white' else { 'White' : base, 'Black' : dev }
+            if { k : tags.get(k) for k in ('White', 'Black') } != want_names:
+                problems.append('%s: players %s, expected %s' % (where, { k : tags.get(k) for k in ('White', 'Black') }, want_names))
+            if tags.get('Opponent') != 'base':
+                problems.append('%s: Opponent %r, expected base' % (where, tags.get('Opponent')))
+        elif not tags.get('Opponent'):
             problems.append('%s: no Opponent tag' % (where))
         if first_report is None or sent['t'] < first_report:
             problems.append('%s: sent before its match' % (where))
@@ -231,15 +251,72 @@ def check_games(events, games, reports):
 
 
 def matches(event, report):
-    doc = report['document']
-    if doc.get('state') != event.state:
+    doc = view(report['document'])
+    if doc['state'] != event.state:
         return False
-    return event.kind != 'results' or document_counts(doc) == { name : event.after[name] for name in COUNTS }
+    return event.kind != 'results' or doc['counts'] == { name : event.after[name] for name in COUNTS }
+
+
+def view(doc):
+    # The same facts from either document: OpenBench's own shape, or match schema v1
+    if 'match' in doc:
+        row   = (doc.get('results') or [{}])[0]
+        penta = row.get('penta') or [None] * 5
+        sprt  = doc.get('sprt') or {}
+        return {
+            'v1' : True, 'id' : doc['match'].get('id'), 'kind' : doc['match'].get('kind'),
+            'state' : doc['match'].get('state'), 'llr' : sprt.get('llr'), 'sprt_result' : sprt.get('result'),
+            'counts' : { **{ name : row.get(name) for name in ('games', 'wins', 'losses', 'draws') },
+                         **dict(zip(('LL', 'LD', 'DD', 'DW', 'WW'), penta)) },
+            'crashes' : sum((row.get('crashes') or {}).values()),
+        }
+    rows = doc.get('results') or [{}]
+    sprt = doc.get('sprt') or {}
+    return {
+        'v1' : False, 'id' : doc.get('id'), 'kind' : doc.get('kind'), 'state' : doc.get('state'),
+        'llr' : sprt.get('current_llr'), 'sprt_result' : sprt.get('result'),
+        'counts' : { name : rows[0].get(name) for name in COUNTS },
+        'crashes' : sum(x.get('crashes', 0) for x in rows),
+    }
 
 
 def document_counts(doc):
-    rows = doc.get('results') or [{}]
-    return { name : rows[0].get(name) for name in COUNTS }
+    return view(doc)['counts']
+
+
+def check_v1(doc, test, engines):
+    # A version 1 document as nyayo's docs/match-schema.md (OpenBench) maps the test
+    from OpenBench import stats
+
+    problems = []
+    dev, base = engines['dev'], engines['base']
+    subject, opponents = doc.get('subject') or {}, doc.get('opponents') or []
+
+    if (subject.get('name'), subject.get('branch'), subject.get('commit')) != (test['dev_engine'], dev['name'], dev['sha']):
+        problems.append('subject %s, the dev engine is %s %s %s' % (
+            [subject.get(x) for x in ('name', 'branch', 'commit')], test['dev_engine'], dev['name'], dev['sha']))
+    if len(opponents) != 1 or (opponents[0].get('id'), opponents[0].get('name'), opponents[0].get('branch')) \
+            != ('base', test['base_engine'], base['name']):
+        problems.append('opponents %s, expected one, base: %s %s' % (opponents, test['base_engine'], base['name']))
+    if [x.get('opponent') for x in doc.get('results') or []] != ['base']:
+        problems.append('results are not one row for base')
+
+    if test['test_mode'] == 'SPRT':
+        counts = (test['losses'], test['draws'], test['wins']) if test['use_tri'] and not test['use_penta'] \
+            else (test['LL'], test['LD'], test['DD'], test['DW'], test['WW'])
+        lower, elo, upper = stats.Elo(counts)
+        got = doc.get('stats') or {}
+        if not (isinstance(got.get('elo'), float) and math.isclose(got['elo'], elo, abs_tol=1e-6)
+                and math.isclose(got.get('error', -1), max(upper - elo, elo - lower), abs_tol=1e-6)):
+            problems.append('stats %s, OpenBench has Elo %.2f +- %.2f' % (got, elo, max(upper - elo, elo - lower)))
+        sprt = doc.get('sprt') or {}
+        want = { 'elo0' : test['elolower'], 'elo1' : test['eloupper'], 'lower' : test['lowerllr'], 'upper' : test['upperllr'] }
+        if any(sprt.get(k) != v for k, v in want.items()):
+            problems.append('sprt %s, the Test has %s' % (sprt, want))
+    elif doc.get('stats') is not None:
+        problems.append('stats sent for a %s test' % (test['test_mode']))
+
+    return problems
 
 
 def timeline(test_id, client_log, events, reports):

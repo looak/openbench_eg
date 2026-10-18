@@ -12,6 +12,8 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument('test_ids', nargs='*', type=int, help='the tests to send')
         parser.add_argument('--all', action='store_true', help='every test, oldest first')
+        parser.add_argument('--schema', choices=['openbench', 'v1'], default=None,
+                            help='the document to send, NYAYO_SCHEMA when left out; v1 moves a match to version 1')
 
     def handle(self, *args, **options):
         if not nyayo_enabled():
@@ -27,7 +29,7 @@ class Command(BaseCommand):
             if unknown:
                 raise CommandError('no such test: %s' % (', '.join(map(str, unknown))))
 
-        failed = [test_id for test_id in ids if not report_test(test_id)]
+        failed = [test_id for test_id in ids if not report_test(test_id, options['schema'])]
         for test_id in ids:
             self.stdout.write('%s test %d' % ('failed' if test_id in failed else 'sent', test_id))
 

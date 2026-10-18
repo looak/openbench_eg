@@ -177,7 +177,9 @@ class NyayoRecorder(Recorder):
                 document = json.loads(body.decode() or 'null')
             except ValueError:
                 problem = 'body is not JSON'
-            if not problem and (not isinstance(document, dict) or document.get('id') != match.group(1)):
+            if not problem and not isinstance(document, dict):
+                problem = 'body is not a JSON object'
+            elif not problem and (document.get('id') or (document.get('match') or {}).get('id')) != match.group(1):
                 problem = 'document id does not match the path'
 
         if problem:

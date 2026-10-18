@@ -23,6 +23,8 @@ from pathlib import Path
 
 import requests
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # OpenBench.stats, for stats checks
+
 from smoke import expect, files
 from smoke.recorders import ClientRecorder, NyayoRecorder
 
@@ -44,6 +46,10 @@ WATCHED = { 'clientSubmitResults' : 'results', 'clientBenchError' : 'bench_error
 
 
 class SmokeFailure(Exception):
+    pass
+
+
+class SmokeSkip(Exception):
     pass
 
 
@@ -228,6 +234,7 @@ class Harness:
             self.env['NYAYO_URL']      = self.nyayo.url
             self.env['NYAYO_TOKEN']    = NYAYO_TOKEN
             self.env['NYAYO_INSTANCE'] = NYAYO_INSTANCE
+            self.env['NYAYO_SCHEMA']   = args.schema
 
         (self.temp / 'server').mkdir()
         self.write_config_dir()
@@ -357,6 +364,16 @@ class Harness:
     def test_row(self, test_id):
         return self.query('SELECT * FROM OpenBench_test WHERE id = ?', test_id)[0]
 
+    def engines(self, test_id):
+        test = self.test_row(test_id)
+        rows = { x['id'] : x for x in self.query('SELECT * FROM OpenBench_engine WHERE id IN (?, ?)', test['dev_id'], test['base_id']) }
+        return { 'dev' : rows[test['dev_id']], 'base' : rows[test['base_id']] }
+
+    def player_names(self, test_id):
+        # v1 names a game's players <engine> <branch>
+        test, engines = self.test_row(test_id), self.engines(test_id)
+        return ('%s %s' % (test['dev_engine'], engines['dev']['name']), '%s %s' % (test['base_engine'], engines['base']['name']))
+
     def results(self, test_id):
         return self.query('SELECT * FROM OpenBench_result WHERE test_id = ?', test_id)
 
@@ -408,21 +425,32 @@ class Harness:
         self.wait_for(lambda: uploaded() >= self.test_row(test_id)['games'], timeout,
                       'the worker to upload the games of test %d' % (test_id), soft=True)
 
-    def backfill(self, *args):
+    def backfill(self, *args, schema=None):
         # manage.py report_to_nyayo, recording a backfill event for each test it sends
         self.settle_all()
         with self.lock:
             ids = [x['id'] for x in self.query('SELECT id FROM OpenBench_test ORDER BY id')] if '--all' in args \
                 else [int(x) for x in args]
             rows = { test_id : self.test_row(test_id) for test_id in ids }
-            output = self.manage('report_to_nyayo', *map(str, args), capture=True)
+            extra = ['--schema', schema] if schema else []
+            result = subprocess.run([sys.executable, str(MANAGE), 'report_to_nyayo'] + extra + list(map(str, args)),
+                                    cwd=ROOT, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            kind = 'backfill-v1' if schema == 'v1' else 'backfill'
             for test_id in ids:
-                self.expect.record(time.time(), 'backfill', test_id, rows[test_id], self.test_row(test_id))
-        return output
+                self.expect.record(time.time(), kind, test_id, rows[test_id], self.test_row(test_id))
+        if result.returncode:
+            raise SmokeFailure('report_to_nyayo %s failed\n%s' % (' '.join(extra + list(map(str, args))), result.stdout[-2000:]))
+        return result.stdout
 
     def settle_all(self):
         for test_id in sorted({ x.test_id for x in self.expect.events }):
             self.settle(test_id, timeout=5)
+
+    @staticmethod
+    def concerns(path, test_id):
+        # A request about this test's match or its games, or about no known match at all
+        match = re.match(r'^/api/matches/openbench-%s-(\d+)(/|$)' % (re.escape(NYAYO_INSTANCE)), path)
+        return match is None or int(match.group(1)) == test_id
 
     def events(self, test_id, kind=None):
         return [x for x in self.expect.events if x.test_id == test_id and (kind is None or x.kind == kind)]
@@ -439,14 +467,17 @@ class Harness:
     def verify(self, test_id):
         self.wait_for_uploads(test_id)
         self.settle(test_id)
+        engines  = self.engines(test_id)
         problems = self.expect.check(
-            test_id, self.nyayo.for_test(test_id), self.test_row(test_id), self.results(test_id))
+            test_id, self.nyayo.for_test(test_id), self.test_row(test_id), self.results(test_id), engines)
+        names    = self.player_names(test_id) if self.args.schema == 'v1' else None
         problems += expect.check_games(
-            self.events(test_id), self.nyayo.games_for_test(test_id), self.nyayo.for_test(test_id))[0]
+            self.events(test_id), self.nyayo.games_for_test(test_id), self.nyayo.for_test(test_id), names)[0]
         if self.nyayo_server:
             problems += self.nyayo_server.check_games(
                 'openbench-%s-%d' % (NYAYO_INSTANCE, test_id), len(self.nyayo.games_for_test(test_id)))
-        problems += ['nyayo recorder: %s %s: %s' % (x['method'], x['path'], x['problem']) for x in self.nyayo.violations]
+        problems += ['nyayo recorder: %s %s: %s' % (x['method'], x['path'], x['problem'])
+                     for x in self.nyayo.violations if self.concerns(x['path'], test_id)]
         if self.nyayo_server and self.expect.expected(test_id):
             problems += self.nyayo_server.check_match('openbench-%s-%d' % (NYAYO_INSTANCE, test_id),
                                                       self.expect.state[test_id], self.test_row(test_id))
@@ -689,6 +720,29 @@ def scenario_backfill(h):
     return 'test %d resent, then all %d tests' % (test_id, tests)
 
 
+def scenario_move_to_v1(h):
+    # A test reported in OpenBench's own shape, then resent as v1: nyayo moves the match once
+    if not h.nyayo_server:
+        raise SmokeSkip('needs --nyayo: only a real nyayo can move a match')
+    if h.args.schema != 'openbench':
+        raise SmokeSkip('needs --schema openbench: the live reports must be in the old shape')
+
+    test_id = h.create_test(test_mode='SPRT', elolower=0.0, eloupper=200.0, alpha=0.05, beta=0.05,
+                            base_options='Threads=1 Hash=16 Strength=0')
+    h.wait_for(lambda: h.test_row(test_id)['finished'], 120, 'SPRT test %d to finish' % (test_id))
+    h.verify(test_id)
+
+    h.backfill(test_id, schema='v1')
+    h.verify(test_id)
+
+    match_id = 'openbench-%s-%d' % (NYAYO_INSTANCE, test_id)
+    rows = h.nyayo_server.query('SELECT opponent FROM matches_matchresult WHERE match_id = ?', match_id)
+    games = h.nyayo_server.query('SELECT DISTINCT opponent FROM matches_game WHERE match_id = ?', match_id)
+    check([x['opponent'] for x in rows] == ['base'], 'nyayo has results for %s, not base' % ([x['opponent'] for x in rows]))
+    check([x['opponent'] for x in games] == ['base'], 'nyayo has games against %s, not base' % ([x['opponent'] for x in games]))
+    return 'test %d moved to v1' % (test_id)
+
+
 SCENARIOS = collections.OrderedDict([
     ('1',  ('GAMES test to max_games',          scenario_games_to_max)),
     ('2',  ('SPRT with wide bounds to a result', scenario_sprt_to_result)),
@@ -701,6 +755,7 @@ SCENARIOS = collections.OrderedDict([
     ('9',  ('no NYAYO_URL',                      scenario_no_nyayo)),
     ('10', ('every game reaches nyayo',          scenario_pgns)),
     ('11', ('report_to_nyayo TEST_ID and --all',  scenario_backfill)),
+    ('12', ('a match moves to v1',                scenario_move_to_v1)),
 ])
 
 # Not written yet, each waiting on the work named
@@ -710,9 +765,12 @@ PENDING = {
 
 def run_scenario(harness, key):
     title, run = SCENARIOS[key]
-    xfail, began = expect.XFAIL.get(key), time.time()
+    xfail, began = expect.xfail(key, harness.args), time.time()
     try:
         detail = run(harness)
+    except SmokeSkip as reason:
+        print('SKIP  %-3s %s (%s)' % (key, title, reason))
+        return True
     except SmokeFailure as error:
         took = time.time() - began
         if xfail:
