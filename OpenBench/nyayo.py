@@ -56,7 +56,7 @@ def match_state(test):
 
 
 def schema_in_use(schema=None):
-    schema = schema or getattr(settings, 'NYAYO_SCHEMA', '') or 'openbench'
+    schema = schema or getattr(settings, 'NYAYO_SCHEMA', '') or 'v1'
     if schema not in ('openbench', 'v1'):
         raise ValueError('NYAYO_SCHEMA must be openbench or v1, not %r' % (schema))
     return schema
@@ -394,7 +394,9 @@ def report_pgn(test_id, result_id, book_index, data, schema=None):
                 # nyayo doesn't know the match (it was down for its reports): send it, then the game again
                 if response.status_code == 404 and report_test(test_id, schema):
                     response = session.put(url, data=body, headers=headers, timeout=5)
-                response.raise_for_status()
+                if refused(response):
+                    logger.error('nyayo refused game %s of test %s: %s', game, test_id, refused(response))
+                    continue
                 sent += 1
             except Exception:
                 logger.exception('OpenBench failed to report game %s of test %s to nyayo', game, test_id)
@@ -419,11 +421,20 @@ def report_test(test_id, schema=None):
             },
             timeout=5,
         )
-        response.raise_for_status()
+        if refused(response):
+            logger.error('nyayo refused the match of test %s: %s', test_id, refused(response))
+            return False
         return True
     except Exception:
         logger.exception('OpenBench failed to report match for test %s to nyayo', test_id)
         return False
+
+
+def refused(response):
+    # nyayo's answer when it isn't 200 or 201: the status and its plain-text reason, which says what to fix
+    if response.status_code in (200, 201):
+        return None
+    return '%d %s' % (response.status_code, response.text.strip()[:500])
 
 
 def _report_loop():
