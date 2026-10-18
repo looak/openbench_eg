@@ -36,7 +36,7 @@ from django.http import FileResponse
 from django.utils import timezone
 from wsgiref.util import FileWrapper
 
-from OpenSite.settings import MEDIA_ROOT, PROJECT_PATH
+from OpenSite.settings import MEDIA_ROOT, OPENBENCH_CONFIG_DIR
 
 from OpenBench.config import OPENBENCH_CONFIG
 from OpenBench.models import *
@@ -136,9 +136,13 @@ def workload_uses_time_based_tc(workload):
        or (base_type != TimeControl.FIXED_NODES and base_type != TimeControl.FIXED_DEPTH)
 
 
+def always_upload(upload_pgns):
+    # The fork keeps every game for training, so FALSE (upstream's default) becomes COMPACT
+    return 'COMPACT' if upload_pgns == 'FALSE' else upload_pgns
+
 def read_git_credentials(engine):
     fname = 'credentials.%s' % (engine.replace(' ', '').lower())
-    fpath = os.path.join(PROJECT_PATH, 'Config', fname)
+    fpath = os.path.join(OPENBENCH_CONFIG_DIR, 'Config', fname)
     if os.path.exists(fpath):
         with open(fpath) as fin:
             return { 'Authorization' : 'token %s' % fin.readlines()[0].rstrip() }
@@ -480,8 +484,6 @@ def update_test(request, machine):
 
         test.save()
 
-    transaction.on_commit(lambda: enqueue_report(test.id))
-
     # Update Result object; No risk from concurrent access
     Result.objects.filter(id=result_id).update(
         games    = F('games'   ) + games,
@@ -508,5 +510,8 @@ def update_test(request, machine):
     Machine.objects.filter(id=machine_id).update(
         updated=timezone.now()
     )
+
+    # Reported once the Result is updated too: the report's counts are the Result rows' sums
+    transaction.on_commit(lambda: enqueue_report(test.id))
 
     return [{}, { 'stop' : True }][test.finished]

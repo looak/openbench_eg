@@ -36,12 +36,21 @@ PROJECT_PATH  = os.path.join(SETTINGS_DIR, os.pardir)
 PROJECT_PATH  = os.path.abspath(PROJECT_PATH)
 TEMPLATE_PATH = os.path.join(PROJECT_PATH, 'Templates')
 
+# Holds Config/, Books/ and Engines/; the smoke test points it at a temp directory
+OPENBENCH_CONFIG_DIR = os.environ.get('OPENBENCH_CONFIG_DIR', '') or PROJECT_PATH
+
 MEDIA_URL  = '/Media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'Media')
 
 NYAYO_URL = os.environ.get('NYAYO_URL', '')
 NYAYO_TOKEN = os.environ.get('NYAYO_TOKEN', '')
 NYAYO_INSTANCE = os.environ.get('NYAYO_INSTANCE', '')
+
+# The document sent: 'openbench', the reporter's own shape, or 'v1', nyayo's match schema
+NYAYO_SCHEMA = os.environ.get('NYAYO_SCHEMA', '') or 'openbench'
+
+# This OpenBench's address as nyayo's pages link to it, e.g. http://172.16.100.11:8000 (v1 only)
+NYAYO_OPENBENCH_URL = os.environ.get('NYAYO_OPENBENCH_URL', '')
 
 INSTALLED_APPS = [
     'OpenBench',
