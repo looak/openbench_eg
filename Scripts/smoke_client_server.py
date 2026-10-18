@@ -326,7 +326,7 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="--full: print the details of expected failures")
     parser.add_argument("--nyayo", default="", help="--full: a nyayo checkout to run behind the recorder")
     parser.add_argument("--nyayo-python", default="", help="--full: the Python for --nyayo (Django 5.2)")
-    parser.add_argument("--schema", default="openbench", choices=["openbench", "v1"],
+    parser.add_argument("--schema", default="v1", choices=["openbench", "v1"],
                         help="--full: the document the server sends nyayo (NYAYO_SCHEMA)")
     args = parser.parse_args()
 
