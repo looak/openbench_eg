@@ -22,6 +22,7 @@
 #     own (superseded), the waiting one is built when sent and carries both
 #   - a game nyayo answers 404 (its match not there yet) has the match sent first, an extra report
 #     of the test as it stands (a resend), then the game again
+#   - a game nyayo answers 503 (busy) is sent again after its Retry-After, and arrives once
 #   - a report never waits for a game: with two tests at once, the second's first report arrives
 #     while the first's games are still being sent (check_status_first)
 #

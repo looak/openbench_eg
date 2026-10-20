@@ -50,6 +50,9 @@ GAME_QUEUE   = queue.Queue()
 REPORT_STOP  = threading.Event()
 REPORT_THREAD = GAME_THREAD = None
 
+# How long a game is sent again while nyayo answers 503 (busy), before it's given up and logged
+GAME_BUSY_LIMIT = 300
+
 
 def nyayo_enabled():
     return bool(
@@ -422,10 +425,10 @@ def report_pgn(test_id, result_id, book_index, data, schema=None):
             colour = subject_colour(tags)
             body   = tag_game(rename_players(tags, *names) if v1 else tags, moves, colour, opponent).encode('utf-8')
             try:
-                response = session.put(url, data=body, headers=headers, timeout=5)
+                response = put_game(session, url, body, headers)
                 # nyayo doesn't know the match (it was down for its reports): send it, then the game again
                 if response.status_code == 404 and report_test(test_id, schema):
-                    response = session.put(url, data=body, headers=headers, timeout=5)
+                    response = put_game(session, url, body, headers)
                 if refused(response):
                     logger.error('nyayo refused game %s of test %s: %s', game, test_id, refused(response))
                     continue
@@ -434,6 +437,23 @@ def report_pgn(test_id, result_id, book_index, data, schema=None):
                 logger.exception('OpenBench failed to report game %s of test %s to nyayo', game, test_id)
 
     return sent == len(games)
+
+
+def put_game(session, url, body, headers):
+    # A 503 is nyayo busy with games, never a refusal: sent again after its Retry-After, for as long
+    # as GAME_BUSY_LIMIT seconds of waiting. Games wait behind it, in order; reports don't.
+    waited = 0
+    while True:
+        response = session.put(url, data=body, headers=headers, timeout=5)
+        if response.status_code != 503 or waited >= GAME_BUSY_LIMIT or REPORT_STOP.is_set():
+            return response
+        try:
+            delay = min(max(float(response.headers.get('Retry-After', 1)), 0.1), 30)
+        except ValueError:
+            delay = 1
+        delay = min(delay, GAME_BUSY_LIMIT - waited)
+        REPORT_STOP.wait(delay)
+        waited += delay
 
 
 def report_test(test_id, schema=None):

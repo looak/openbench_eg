@@ -777,6 +777,22 @@ def scenario_two_tests(h):
         second, first, score(h.test_row(second)), score(h.test_row(first)))
 
 
+def scenario_nyayo_busy(h):
+    # nyayo answers every game 503 (busy, Retry-After 1) twice before taking it: each is sent again, none lost
+    test_id = h.create_test(test_mode='GAMES', max_games=4)
+    h.nyayo.busy_games(test_id, 2)
+    h.wait_for(lambda: h.test_row(test_id)['finished'], 60, 'test %d to finish' % (test_id))
+    h.wait_for_uploads(test_id)
+    h.settle(test_id, timeout=30)
+    h.verify(test_id)
+
+    games = h.nyayo.games_for_test(test_id)
+    busied = collections.Counter(x['game'] for x in h.nyayo.busied if x['test_id'] == test_id)
+    check(games and all(busied[x['game']] == 2 for x in games),
+          'not every game was answered 503 twice before it was taken: %s' % (dict(busied)))
+    return 'test %d: %d games, each sent again after two 503s' % (test_id, len(games))
+
+
 SCENARIOS = collections.OrderedDict([
     ('1',  ('GAMES test to max_games',          scenario_games_to_max)),
     ('2',  ('SPRT with wide bounds to a result', scenario_sprt_to_result)),
@@ -791,6 +807,7 @@ SCENARIOS = collections.OrderedDict([
     ('11', ('report_to_nyayo TEST_ID and --all',  scenario_backfill)),
     ('12', ('a match moves to v1',                scenario_move_to_v1)),
     ('13', ('two tests, status ahead of games',   scenario_two_tests)),
+    ('14', ('nyayo busy for games (503)',         scenario_nyayo_busy)),
 ])
 
 # Not written yet, each waiting on the work named
