@@ -17,6 +17,14 @@
 #
 # An event while nyayo is down has no report (lost); the next report carries the whole state.
 #
+# Reports and games go on queues of their own, each drained by its own thread:
+#   - a test's report is queued once: an event while its report still waits has no report of its
+#     own (superseded), the waiting one is built when sent and carries both
+#   - a game nyayo answers 404 (its match not there yet) has the match sent first, an extra report
+#     of the test as it stands (a resend), then the game again
+#   - a report never waits for a game: with two tests at once, the second's first report arrives
+#     while the first's games are still being sent (check_status_first)
+#
 # The states are openbench-reports.md's ("The fixes"), not what OpenBench/nyayo.py does today.
 
 import bz2
@@ -101,21 +109,29 @@ class Expectations:
     def expected(self, test_id):
         return [x for x in self.events if x.test_id == test_id and x.report]
 
-    def check(self, test_id, reports, final, results, engines=None):
-        # Returns the problems found: nothing missing, nothing extra, always consistent
+    def check(self, test_id, reports, final, results, engines=None, resends=0):
+        # Returns the problems found: nothing missing, nothing extra, always consistent.
+        # resends: how many of the test's games nyayo answered 404, each worth one report more
 
         problems = []
         match_id = 'openbench-%s-%d' % (self.instance, test_id)
 
         # An event while nyayo was down may still have its report arrive: the reporter sends
         # from its queue after the event, maybe once nyayo is back. Such a report is optional,
-        # so reports are aligned to events, skipping optional events they don't match.
+        # and so is one superseded: the next event came before this report arrived, so it may
+        # have found the report still waiting. Reports are aligned to events, skipping optional
+        # events they don't match; one repeating the report before it may be a resend.
         events = [x for x in self.events if x.test_id == test_id and x.kind != 'pgn' and (x.report or x.lost)]
+        optional = lambda index, report: events[index].lost or (index + 1 < len(events) and events[index + 1].t < report['t'])
         pairs, extra, position = [], 0, 0
         for report in reports:
             index = position
-            while index < len(events) and events[index].lost and not matches(events[index], report):
+            while index < len(events) and not matches(events[index], report) and optional(index, report):
                 index += 1
+            if resends and pairs and (index == len(events) or not matches(events[index], report)) \
+                    and same_state(pairs[-1][1], report):
+                resends -= 1
+                continue
             if index == len(events):
                 extra += 1
                 continue
@@ -248,6 +264,27 @@ def check_games(events, games, reports, names=None):
             problems.append('%s: sent before its match' % (where))
 
     return problems, len(set(want) - optional)
+
+
+def check_status_first(first, second, first_events, first_games, second_events, second_reports):
+    # The second test's first report arrived while games of the first, uploaded before that
+    # report was queued, were still to be answered: status didn't wait behind games
+
+    queued = min((x.t for x in second_events if x.report), default=None)
+    if queued is None or not second_reports:
+        return ['test %d: no report arrived' % (second)]
+    arrived  = min(x['t'] for x in second_reports)
+    uploaded = { game : event.t for event in first_events if event.kind == 'pgn' for game in uploaded_games(event) }
+    earlier  = [x for x in first_games if uploaded.get(x['game'], queued) < queued]
+    if any(x['t'] > arrived for x in earlier):
+        return []
+    return ['the first report of test %d arrived %.2fs after it was queued, after all %d game(s) of test %d '
+            'uploaded before it: status waited behind games' % (second, arrived - queued, len(earlier), first)]
+
+
+def same_state(older, newer):
+    a, b = view(older['document']), view(newer['document'])
+    return (a['state'], a['counts']) == (b['state'], b['counts'])
 
 
 def matches(event, report):
