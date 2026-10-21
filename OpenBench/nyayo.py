@@ -397,6 +397,14 @@ def subject_colour(headers):
     return ''
 
 
+def game_body(tags, moves, names, v1, opponent):
+    # A game as nyayo takes it. The fork's workers name and tag each game before the upload (Client/pgn_util.py);
+    # one already tagged [Subject] goes as it is, an older one is renamed and tagged here
+    if re.search(r'^\[Subject "', tags, re.M):
+        return '%s\n\n%s\n' % (tags, moves)
+    return tag_game(rename_players(tags, *names) if v1 else tags, moves, subject_colour(tags), opponent)
+
+
 def report_pgn(test_id, result_id, book_index, data, schema=None):
     # Each finished game of the batch, PUT to /api/matches/<id>/games/<result>.<book_index>.<n>
     if not nyayo_enabled():
@@ -422,8 +430,7 @@ def report_pgn(test_id, result_id, book_index, data, schema=None):
         for number, (tags, moves) in enumerate(games, 1):
             game = '%d.%d.%d' % (result_id, book_index, number)
             url  = '%s/api/matches/%s/games/%s' % (settings.NYAYO_URL.rstrip('/'), match_id, game)
-            colour = subject_colour(tags)
-            body   = tag_game(rename_players(tags, *names) if v1 else tags, moves, colour, opponent).encode('utf-8')
+            body = game_body(tags, moves, names, v1, opponent).encode('utf-8')
             try:
                 response = put_game(session, url, body, headers)
                 # nyayo doesn't know the match (it was down for its reports): send it, then the game again

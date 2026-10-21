@@ -43,7 +43,26 @@ def pgn_header_list(lines):
     # PGN Format: [<Header> "<Value>"]
     return { f.split()[0][1:] : re.search(r'"([^"]*)"', f).group(1) for f in lines }
 
-def pgn_strip_headers(headers, compact):
+def pgn_player_tags(headers, players):
+
+    # cutechess plays <engine>-dev and <engine>-base; the fork names them as its match document
+    # does, <engine> <branch>, and tags dev's colour and the opponent (nyayo's game database)
+    renamed = dict(headers)
+    for colour in ('White', 'Black'):
+        name = headers.get(colour, '')
+        side = 'dev' if name.endswith('-dev') else 'base' if name.endswith('-base') else None
+        if side:
+            renamed[colour] = players[side].replace('"', "'")
+        if side == 'dev':
+            renamed['Subject'] = colour.lower()
+    renamed['Opponent'] = 'base'
+    return renamed
+
+def pgn_strip_headers(headers, compact, players=None):
+
+    # players: { 'dev' : <name>, 'base' : <name> }, the final names of cutechess's <engine>-<side>
+    if players:
+        headers = pgn_player_tags(headers, players)
 
     # 7-Tag Roster that is required to be a legal PGN
     desired = [
@@ -58,10 +77,13 @@ def pgn_strip_headers(headers, compact):
         'TimeControl', # Useful to extract statistics
         'Variant',     # Useful to account for FRC/DFRC
         'ScaleFactor', # Useful to extract statistics
+        'Termination', # Tells an adjudication from a time loss or a crash
     ]
 
     if not compact: # Useful to reconstruct time events
         desired += ['GameEndTime']
+
+    desired += ['Subject', 'Opponent'] # The fork's, from pgn_player_tags()
 
     # PGN Format: [<Header> "<Value>"]
     return '\n'.join('[%s "%s"]' % (f, headers[f]) for f in desired if f in headers)
@@ -85,21 +107,21 @@ def pgn_strip_movelist(move_text, compact):
     # PGNs expect trailing game result text
     return stripped + re.compile(REGEX_GAME_RESULT).search(move_text).group(1)
 
-def strip_entire_pgn(file_name, scale_factor, compact):
+def strip_entire_pgn(file_name, scale_factor, compact, players=None):
 
     stripped = ''
     for header_dict, move_text in pgn_iterator(file_name):
         header_dict['ScaleFactor'] = str(scale_factor)
-        stripped += pgn_strip_headers(header_dict, compact) + '\n\n'
+        stripped += pgn_strip_headers(header_dict, compact, players) + '\n\n'
         stripped += pgn_strip_movelist(move_text, compact) + '\n\n'
 
     return stripped
 
-def compress_list_of_pgns(file_names, scale_factor, compact):
+def compress_list_of_pgns(file_names, scale_factor, compact, players=None):
 
     text = ''
     for fname in file_names:
         print ('Compressing %s...' % (fname))
-        text += strip_entire_pgn(fname, scale_factor, compact)
+        text += strip_entire_pgn(fname, scale_factor, compact, players)
 
     return bz2.compress(text.encode())

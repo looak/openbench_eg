@@ -53,6 +53,11 @@ def process_content(content, data, result_id, use_scale):
         factor    = float(headers['ScaleFactor']) if use_scale else 1.00
         white     = headers['White'].split('-')[-1]
         black     = headers['Black'].split('-')[-1]
+
+        # The fork's workers upload <engine> <branch> and tag dev's colour as [Subject]
+        if 'Subject' in headers:
+            white = 'dev' if headers['Subject'] == 'white' else 'base'
+            black = 'base' if white == 'dev' else 'dev'
         white_stm = 'FEN' not in headers or headers['FEN'].split()[1] == 'w'
 
         # Setup to track stats per result-id
