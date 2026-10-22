@@ -115,7 +115,8 @@ def find_free_port():
 class NyayoServer:
 
     # A real nyayo from a checkout (--nyayo PATH), its data in a temp directory, and a
-    # machine token for the reporter. The nyayo recorder forwards to it.
+    # machine token for the reporter. The nyayo recorder forwards to it. A nyayo with a
+    # worker (manage.py worker: uploads taken at once, read in the background) runs it too.
 
     def __init__(self, checkout, python, temp):
         self.checkout = Path(checkout).resolve()
@@ -123,7 +124,8 @@ class NyayoServer:
         self.data     = temp / 'nyayo'
         self.port     = find_free_port()
         self.url      = 'http://127.0.0.1:%d' % (self.port)
-        self.proc     = self.log = None
+        self.proc     = self.log = self.worker = self.worker_log = None
+        self.uploads  = (self.checkout / 'nyayo' / 'matches' / 'management' / 'commands' / 'worker.py').is_file()
 
         if not (self.checkout / 'manage.py').is_file() or not (self.checkout / 'nyayo').is_dir():
             raise SmokeFailure('%s is not a nyayo checkout' % (self.checkout))
@@ -135,6 +137,7 @@ class NyayoServer:
             'NYAYO_DEBUG'         : '1',
             'NYAYO_SECRET_KEY'    : 'openbench-smoke',
             'NYAYO_ALLOWED_HOSTS' : '127.0.0.1,localhost',
+            'NYAYO_SEAL_AFTER'    : '2',  # A match ended and quiet this long has its open batch sealed
         })
 
     def manage(self, *args):
@@ -155,6 +158,11 @@ class NyayoServer:
             [self.python, '-u', 'manage.py', 'runserver', '127.0.0.1:%d' % (self.port), '--noreload'],
             cwd=self.checkout, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.log = LogTail(self.proc.stdout, self.data.parent / 'nyayo.log')
+        if self.uploads:
+            self.worker = subprocess.Popen(
+                [self.python, '-u', 'manage.py', 'worker', '--interval', '0.2'],
+                cwd=self.checkout, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            self.worker_log = LogTail(self.worker.stdout, self.data.parent / 'nyayo-worker.log')
 
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -192,6 +200,8 @@ class NyayoServer:
 
     def check_uploads(self, match_id, uploads):
         # nyayo kept every upload it took, the bytes as sent (their sha256) and all their games
+        if self.uploads:
+            return self.check_put_away(match_id, uploads)
         rows = { x['batch'] : x for x in self.query(
             'SELECT batch, games, sha256 FROM matches_gamebatch WHERE match_id = ?', match_id) }
         problems = []
@@ -207,7 +217,59 @@ class NyayoServer:
             problems.append('nyayo has upload(s) nobody sent: %s' % (extra[:5]))
         return problems
 
+    def check_put_away(self, match_id, uploads, timeout=30):
+        # nyayo's worker read every upload and kept its games: the upload done with the sha256 sent, a card
+        # per game placing both players (the subject's colour, the opponent) and the game as it came
+        sent = { x['upload'] : x for x in uploads }
+        pending = lambda: self.query("SELECT name FROM matches_upload WHERE match_id = ? AND state = 'pending'", match_id)
+        deadline = time.time() + timeout
+        while pending() and time.time() < deadline:
+            if self.worker.poll() is not None:
+                return ['nyayo\'s worker exited\n%s' % (self.worker_log.tail())]
+            time.sleep(0.25)
+
+        problems, rows = [], { x['name'] : x for x in self.query(
+            'SELECT name, sha256, state, reason, games, appended FROM matches_upload WHERE match_id = ?', match_id) }
+        for name, upload in sorted(sent.items()):
+            row = rows.get(name)
+            if row is None:
+                problems.append('nyayo has no upload %s' % (name))
+            elif row['state'] != 'done':
+                problems.append('nyayo has upload %s %s: %s' % (name, row['state'], row['reason']))
+            elif (row['sha256'], row['games'], row['appended']) != (upload['sha256'], upload['games'], upload['games']):
+                problems.append('nyayo has upload %s as %d game(s), %d kept, sha256 %s; sent %d, %s' % (
+                    name, row['games'], row['appended'], row['sha256'][:12], upload['games'], upload['sha256'][:12]))
+        extra = sorted(set(rows) - set(sent))
+        if extra:
+            problems.append('nyayo has upload(s) nobody sent: %s' % (extra[:5]))
+
+        # Its cards and the games as it keeps them, read through nyayo's own catalogue
+        output = self.manage('shell', '-c', (
+            'import json; from nyayo.matches import catalogue as c; '
+            'print("SMOKE_CARDS", json.dumps([{**x, "pgn": (c.read_game(%r, x["game"]) or b"").decode()} '
+            'for x in c.cards(%r)]))') % (match_id, match_id))
+        cards = { x['game'] : x for x in json.loads(output.split('SMOKE_CARDS', 1)[1]) }
+        games = { '%s.%d' % (name, n) : pgn for name, x in sent.items() for n, pgn in enumerate(expect.split_upload(x['data']), 1) }
+        for game, pgn in sorted(games.items()):
+            card = cards.get(game)
+            tags = dict(re.findall(r'^\[(\w+) "([^"]*)"\]$', pgn, re.M))
+            if card is None:
+                problems.append('nyayo has no card for game %s' % (game))
+                continue
+            if card['colour'] != tags.get('Subject') or card['opponent'] is None:
+                problems.append('nyayo places game %s as %s against %s, it says Subject %s' % (
+                    game, card['colour'] or 'nobody', card['opponent'], tags.get('Subject')))
+            if card['termination'] != tags.get('Termination', ''):
+                problems.append('nyayo has game %s ended by %r, it says %r' % (game, card['termination'], tags.get('Termination')))
+            if expect.normal(card['pgn']) != expect.normal(pgn):
+                problems.append('nyayo keeps game %s other than it was sent' % (game))
+        extra = sorted(set(cards) - set(games))
+        if extra:
+            problems.append('nyayo has card(s) for game(s) nobody sent: %s' % (extra[:5]))
+        return problems
+
     def stop(self):
+        stop_process(self.worker)
         stop_process(self.proc)
 
 
@@ -957,6 +1019,8 @@ def main(args):
         finally:
             if nyayo:
                 if failed: print('\n---- nyayo log (tail; full log in %s) ----\n%s' % (nyayo.log.path, nyayo.log.tail()))
+                if failed and nyayo.worker_log:
+                    print('\n---- nyayo worker log (tail; full log in %s) ----\n%s' % (nyayo.worker_log.path, nyayo.worker_log.tail()))
                 nyayo.stop()
             harness.close(keep=args.keep or bool(failed))
 
