@@ -3,7 +3,7 @@
 # The fork's workers upload each game with its final players and tags (nyayo's game database):
 #   - pgn_util names <engine>-dev and <engine>-base <engine> <branch>, tags Subject and Opponent, keeps Termination
 #   - cutechess still plays under <engine>-dev and <engine>-base, so the result counts are unchanged
-#   - the reporter sends a game already tagged as it is, and still renames and tags an older one, once
+#   - the reporter sends an upload already tagged as it is, and still renames and tags an older one, once
 # Run from UnitTests/ with the Client's requirements installed (Client/requirements.txt).
 
 import importlib.util
@@ -86,7 +86,7 @@ def load_reporter():
     for name in ('OpenBench', 'OpenBench.stats', 'OpenBench.models'):
         sys.modules.setdefault(name, types.ModuleType(name))
     sys.modules['OpenBench'].__path__ = []
-    for model in ('LogEvent', 'Result', 'Test'):
+    for model in ('LogEvent', 'PGN', 'Result', 'Test'):
         setattr(sys.modules['OpenBench.models'], model, None)
 
     spec   = importlib.util.spec_from_file_location('nyayo_reporter', os.path.join(PARENT, 'OpenBench', 'nyayo.py'))
@@ -96,27 +96,34 @@ def load_reporter():
 
 def test_reporter_once():
 
+    import bz2
     nyayo = load_reporter()
+    test  = types.SimpleNamespace(dev_engine='Weiss', dev=types.SimpleNamespace(name='feature x'),
+                                  base_engine='Weiss', base=types.SimpleNamespace(name='master'))
     names = ('Weiss feature x', 'Weiss master')
 
-    with open('example3.pgn') as fin:
-        older = nyayo.split_games(fin.read())[0]
-    tags, moves = older
+    # An older upload, cutechess's names: every game renamed and tagged on the server, in the worker's layout
+    with open('example3.pgn', 'rb') as fin:
+        older = bz2.compress(fin.read())
+    body  = nyayo.name_and_tag(test, older)
+    games = nyayo.split_games(bz2.decompress(body).decode())
+    assert body != older and len(games) == len(nyayo.split_games(bz2.decompress(older).decode())) == 34
+    for tags, _ in games:
+        sent = tags_of(tags)
+        colour = sent['Subject']
+        assert (sent['White'], sent['Black']) == (names if colour == 'white' else names[::-1]), sent
+        assert sent['Opponent'] == 'base' and tags.count('[Subject ') == 1 and tags.count('[Opponent ') == 1
+    assert bz2.decompress(body).decode().endswith('\n\n')
 
-    # An older upload, cutechess's names: renamed and tagged on the server
-    body = nyayo.game_body(tags, moves, names, True, 'base')
-    sent = tags_of(body.split('\n\n')[0])
-    assert (sent['White'], sent['Black'], sent['Subject'], sent['Opponent']) == (*names, 'white', 'base'), sent
+    # Sent again, or uploaded named and tagged by the worker: the same bytes, no second rename or tag
+    assert nyayo.name_and_tag(test, body) is body
+    assert nyayo.name_and_tag(test, nyayo.name_and_tag(test, older)) == body  # And compressed the same each time
 
-    # Sent again, or uploaded named and tagged by the worker: as it is, no second rename or tag
-    tags, moves = nyayo.split_games(body)[0]
-    assert nyayo.game_body(tags, moves, names, True, 'base') == body
-    assert body.count('[Subject ') == 1 and body.count('[Opponent ') == 1
-
-    headers = pgn_util.pgn_header_list(x for x in tags.split('\n') if x)
+    headers = pgn_util.pgn_header_list(x for x in games[0][0].split('\n') if x)
     headers['White'], headers['Black'] = 'Weiss-dev', 'Weiss-base'
-    worker_tags = pgn_util.pgn_strip_headers(headers, True, { 'dev' : names[0], 'base' : names[1] })
-    assert nyayo.game_body(worker_tags, moves, ('wrong', 'names'), True, 'other') == '%s\n\n%s\n' % (worker_tags, moves)
+    upload = bz2.compress(('%s\n\n%s\n\n' % (pgn_util.pgn_strip_headers(headers, True, dict(zip(('dev', 'base'), names))),
+                                              games[0][1])).encode())
+    assert nyayo.name_and_tag(test, upload) is upload
 
 if __name__ == '__main__':
     os.chdir(os.path.dirname(os.path.abspath(__file__)))

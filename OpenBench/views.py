@@ -42,6 +42,7 @@ from OpenBench.models import *
 from django.contrib.auth.models import User
 from OpenSite.settings import MEDIA_ROOT
 
+from django.conf import settings
 from django.db import transaction, IntegrityError
 from django.db.models import F, Q
 from django.http import HttpResponse, JsonResponse, FileResponse
@@ -930,7 +931,7 @@ def api_pgns(request, pgn_id):
     except: return api_response({ 'error' : 'Requested Workload Id does not exist' })
 
     # 2. Make sure there actually is a PGN attached to the Workload
-    pgn_path = FileSystemStorage('Media/PGNs').path('%d.pgn.tar' % (pgn_id))
+    pgn_path = os.path.join(settings.MEDIA_ROOT, 'PGNs', '%d.pgn.tar' % (pgn_id))
     if not os.path.exists(pgn_path):
         return api_response({ 'error' : 'Unable to find PGN for Workload #%d' % (pgn_id) })
 

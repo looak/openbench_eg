@@ -1,8 +1,10 @@
 import bz2
 import collections
 import logging
+import os
 import queue
 import re
+import tarfile
 import threading
 
 import requests
@@ -11,7 +13,7 @@ from django.utils import timezone
 
 import OpenBench.stats
 
-from OpenBench.models import LogEvent, Result, Test
+from OpenBench.models import LogEvent, PGN, Result, Test
 
 logger = logging.getLogger(__name__)
 
@@ -340,23 +342,15 @@ def enqueue_report(test_id):
 
 
 def enqueue_pgn(test_id, result_id, book_index, data):
-    # A worker's uploaded batch (.pgn.bz2), on the games' queue: in order, behind no report
+    # A worker's upload (.pgn.bz2), on the games' queue: in order, behind no report
     if not nyayo_enabled():
         return False
     GAME_QUEUE.put((test_id, result_id, book_index, data))
     return True
 
 
-def nyayo_opponent_id(name):
-    # The id nyayo gives the test's one opponent, from its name (nyayo/matches/ingest.py, safe_id)
-    text = re.sub(r'[^A-Za-z0-9._-]+', '-', str(name or '').strip()).strip('._-') or 'opponent-1'
-    if not text[0].isalnum():
-        text = 'x-%s' % (text)
-    return text[:64]
-
-
 def split_games(text):
-    # A stripped batch is "<headers>\n\n<moves>\n\n" per game (Client/pgn_util.py)
+    # A stripped upload is "<headers>\n\n<moves>\n\n" per game (Client/pgn_util.py)
     games, headers = [], None
     for block in re.split(r'\n\s*\n', text.strip()):
         block = block.strip()
@@ -397,61 +391,61 @@ def subject_colour(headers):
     return ''
 
 
-def game_body(tags, moves, names, v1, opponent):
-    # A game as nyayo takes it. The fork's workers name and tag each game before the upload (Client/pgn_util.py);
-    # one already tagged [Subject] goes as it is, an older one is renamed and tagged here
-    if re.search(r'^\[Subject "', tags, re.M):
-        return '%s\n\n%s\n' % (tags, moves)
-    return tag_game(rename_players(tags, *names) if v1 else tags, moves, subject_colour(tags), opponent)
+def name_and_tag(test, data):
+    # An upload as nyayo takes it. From client 39 the worker names and tags every game (Client/pgn_util.py), and the
+    # bytes go as they are. An older one (the tars' uploads from before) still has cutechess's names and no tags: its
+    # games are renamed and tagged here, and it is compressed again, so its sha256 is no longer the tar's.
+    games  = split_games(bz2.decompress(data).decode('utf-8'))
+    tagged = lambda tags: re.search(r'^\[Subject "', tags, re.M)
+    if all(tagged(tags) for tags, _ in games):
+        return data
+
+    names, text = (player_name(test.dev_engine, test.dev.name), player_name(test.base_engine, test.base.name)), ''
+    for tags, moves in games:
+        if tagged(tags):
+            text += '%s\n\n%s\n\n' % (tags, moves)
+        else:
+            text += tag_game(rename_players(tags, *names), moves, subject_colour(tags), 'base') + '\n'
+    return bz2.compress(text.encode('utf-8'))  # The worker's layout and compression level
 
 
 def report_pgn(test_id, result_id, book_index, data, schema=None):
-    # Each finished game of the batch, PUT to /api/matches/<id>/games/<result>.<book_index>.<n>
+    # A workload's upload, PUT whole to /api/matches/<id>/pgns/<result>.<book_index> as application/x-bzip2.
+    # nyayo answers 202 and reads it later (its worker); 200 is the same bytes again
     if not nyayo_enabled():
         return False
 
+    upload = '%d.%d' % (result_id, book_index)
     try:
-        test     = Test.objects.get(id=test_id)
-        match_id = build_match_id(test)
-        games    = split_games(bz2.decompress(data).decode('utf-8'))
-        v1       = schema_in_use(schema) == 'v1'
-        opponent = 'base' if v1 else nyayo_opponent_id(test.base.name)
-        names    = (player_name(test.dev_engine, test.dev.name), player_name(test.base_engine, test.base.name))
-        headers  = {
-            'Authorization': 'Bearer %s' % settings.NYAYO_TOKEN,
-            'Content-Type': 'application/x-chess-pgn; charset=utf-8',
-        }
+        test    = Test.objects.get(id=test_id)
+        body    = name_and_tag(test, data)
+        url     = '%s/api/matches/%s/pgns/%s' % (settings.NYAYO_URL.rstrip('/'), build_match_id(test), upload)
+        headers = { 'Authorization': 'Bearer %s' % settings.NYAYO_TOKEN, 'Content-Type': 'application/x-bzip2' }
     except Exception:
-        logger.exception('OpenBench failed to read the PGNs of test %s for nyayo', test_id)
+        logger.exception('OpenBench failed to read upload %s of test %s for nyayo', upload, test_id)
         return False
 
-    sent = 0
-    with requests.Session() as session:
-        for number, (tags, moves) in enumerate(games, 1):
-            game = '%d.%d.%d' % (result_id, book_index, number)
-            url  = '%s/api/matches/%s/games/%s' % (settings.NYAYO_URL.rstrip('/'), match_id, game)
-            body = game_body(tags, moves, names, v1, opponent).encode('utf-8')
-            try:
-                response = put_game(session, url, body, headers)
-                # nyayo doesn't know the match (it was down for its reports): send it, then the game again
-                if response.status_code == 404 and report_test(test_id, schema):
-                    response = put_game(session, url, body, headers)
-                if refused(response):
-                    logger.error('nyayo refused game %s of test %s: %s', game, test_id, refused(response))
-                    continue
-                sent += 1
-            except Exception:
-                logger.exception('OpenBench failed to report game %s of test %s to nyayo', game, test_id)
-
-    return sent == len(games)
+    try:
+        with requests.Session() as session:
+            response = put_upload(session, url, body, headers)
+            # nyayo doesn't know the match (it was down for its reports): send it, then the upload again
+            if response.status_code == 404 and report_test(test_id, schema):
+                response = put_upload(session, url, body, headers)
+        if refused(response):
+            logger.error('nyayo refused upload %s of test %s: %s', upload, test_id, refused(response))
+            return False
+        return True
+    except Exception:
+        logger.exception('OpenBench failed to report upload %s of test %s to nyayo', upload, test_id)
+        return False
 
 
-def put_game(session, url, body, headers):
+def put_upload(session, url, body, headers):
     # A 503 is nyayo busy with games, never a refusal: sent again after its Retry-After, for as long
-    # as GAME_BUSY_LIMIT seconds of waiting. Games wait behind it, in order; reports don't.
+    # as GAME_BUSY_LIMIT seconds of waiting. Uploads wait behind it, in order; reports don't.
     waited = 0
     while True:
-        response = session.put(url, data=body, headers=headers, timeout=5)
+        response = session.put(url, data=body, headers=headers, timeout=30)
         if response.status_code != 503 or waited >= GAME_BUSY_LIMIT or REPORT_STOP.is_set():
             return response
         try:
@@ -461,6 +455,42 @@ def put_game(session, url, body, headers):
         delay = min(delay, GAME_BUSY_LIMIT - waited)
         REPORT_STOP.wait(delay)
         waited += delay
+
+
+def stored_uploads(test_id):
+    # A test's uploads as OpenBench keeps them, [(result id, book index, bytes)] in the order uploaded: the PGN
+    # watcher's tar (Media/PGNs/<test>.pgn.tar), then any not moved into it yet (Media/<test>.<result>.<book>.pgn.bz2)
+    uploads, seen = [], set()
+    tar_path = os.path.join(settings.MEDIA_ROOT, 'PGNs', '%d.pgn.tar' % (test_id))
+    if os.path.exists(tar_path):
+        with tarfile.open(tar_path) as tar:
+            for member in tar.getmembers():
+                found = re.fullmatch(r'%d\.(\d+)\.(\d+)\.pgn\.bz2' % (test_id), member.name)
+                if found and member.isfile():
+                    key = (int(found.group(1)), int(found.group(2)))
+                    # A name twice in the tar: the newer bytes, in the place of the first
+                    if key in seen:
+                        uploads = [x for x in uploads if x[:2] != key]
+                    uploads.append((*key, tar.extractfile(member).read()))
+                    seen.add(key)
+    for pgn in PGN.objects.filter(test_id=test_id, processed=False).order_by('id'):
+        path = os.path.join(settings.MEDIA_ROOT, pgn.filename())
+        if (pgn.result_id, pgn.book_index) not in seen and os.path.exists(path):
+            with open(path, 'rb') as fin:
+                uploads.append((pgn.result_id, pgn.book_index, fin.read()))
+            seen.add((pgn.result_id, pgn.book_index))
+    return uploads
+
+
+def report_uploads(test_id, schema=None):
+    # Sends a test's stored uploads again, as the reporter would have (report_to_nyayo --games). Returns (sent, failed)
+    sent = failed = 0
+    for result_id, book_index, data in stored_uploads(test_id):
+        if report_pgn(test_id, result_id, book_index, data, schema):
+            sent += 1
+        else:
+            failed += 1
+    return sent, failed
 
 
 def report_test(test_id, schema=None):
@@ -490,8 +520,9 @@ def report_test(test_id, schema=None):
 
 
 def refused(response):
-    # nyayo's answer when it isn't 200 or 201: the status and its plain-text reason, which says what to fix
-    if response.status_code in (200, 201):
+    # nyayo's answer when it isn't 200, 201 or 202 (an upload taken, read later): the status and its plain-text
+    # reason, which says what to fix
+    if response.status_code in (200, 201, 202):
         return None
     return '%d %s' % (response.status_code, response.text.strip()[:500])
 

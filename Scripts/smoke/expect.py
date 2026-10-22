@@ -11,19 +11,22 @@
 #   APPROVE, MODIFY                        a report, state unchanged
 #   bench_error  (clientBenchError)        error
 #   backfill (report_to_nyayo)             one report, the test as it stands
-#   pgn      (clientSubmitPGN)             no match report; one PUT .../games/<result>.<book_index>.<n> per
-#                                          game in the batch, the game as uploaded, after the match exists in
-#                                          nyayo. The worker uploads each game named <engine> <branch> and
-#                                          tagged Subject and Opponent "base", cutechess's Termination kept
+#   pgn      (clientSubmitPGN)             no match report; one PUT .../pgns/<result>.<book_index>, the bytes
+#                                          the worker uploaded, after the match exists in nyayo. The worker
+#                                          uploads each game named <engine> <branch> and tagged Subject and
+#                                          Opponent "base", cutechess's Termination kept
+#   backfill-upload (report_to_nyayo --games)  no match report; the stored upload again, the same bytes, or for
+#                                          one from before client 39 (no Subject) its games renamed and tagged,
+#                                          compressed again: the same bytes on every backfill
 #
 # An event while nyayo is down has no report (lost); the next report carries the whole state.
 #
 # Reports and games go on queues of their own, each drained by its own thread:
 #   - a test's report is queued once: an event while its report still waits has no report of its
 #     own (superseded), the waiting one is built when sent and carries both
-#   - a game nyayo answers 404 (its match not there yet) has the match sent first, an extra report
-#     of the test as it stands (a resend), then the game again
-#   - a game nyayo answers 503 (busy) is sent again after its Retry-After, and arrives once
+#   - an upload nyayo answers 404 (its match not there yet) has the match sent first, an extra report
+#     of the test as it stands (a resend), then the upload again
+#   - an upload nyayo answers 503 (busy) is sent again after its Retry-After, and arrives once
 #   - a report never waits for a game: with two tests at once, the second's first report arrives
 #     while the first's games are still being sent (check_status_first)
 #
@@ -56,6 +59,7 @@ class Event:
         self.t, self.kind, self.test_id, self.lost = t, kind, test_id, lost
         self.before, self.after = before, after
         self.report, self.state = report, state
+        self.old = False  # An upload from before client 39: no Subject, cutechess's names
 
     def __repr__(self):
         outcome = self.state if self.report else ('%s, if it arrives' % (self.state) if self.lost else 'no report')
@@ -94,7 +98,7 @@ class Expectations:
             state  = self.before_delete.pop(test_id, previous)
         elif kind in ('APPROVE', 'MODIFY'):
             state  = previous
-        elif kind == 'pgn':
+        elif kind in ('pgn', 'backfill-upload'):
             report, state = False, previous
         elif kind in ('backfill', 'backfill-v1'):
             state  = finished_state(after) or previous
@@ -123,7 +127,8 @@ class Expectations:
         # and so is one superseded: the next event came before this report arrived, so it may
         # have found the report still waiting. Reports are aligned to events, skipping optional
         # events they don't match; one repeating the report before it may be a resend.
-        events = [x for x in self.events if x.test_id == test_id and x.kind != 'pgn' and (x.report or x.lost)]
+        events = [x for x in self.events if x.test_id == test_id and x.kind not in ('pgn', 'backfill-upload')
+                  and (x.report or x.lost)]
         optional = lambda index, report: events[index].lost or (index + 1 < len(events) and events[index + 1].t < report['t'])
         pairs, extra, position = [], 0, 0
         for report in reports:
@@ -204,68 +209,106 @@ class Expectations:
 
 
 def uploaded_games(event):
-    # The games of an uploaded batch, as {game id: text}, split on [Event independently of the server
+    # The games of an upload, as {game id: text}, split on [Event independently of the server
     text   = bz2.decompress(event.upload).decode('utf-8').strip()
     chunks = [x.strip() for x in re.split(r'\n\s*\n(?=\[Event )', text) if x.strip()]
     return { '%s.%s.%d' % (event.result_id, event.book_index, n) : chunk for n, chunk in enumerate(chunks, 1) }
+
+
+def upload_name(event):
+    return '%s.%s' % (event.result_id, event.book_index)
 
 
 def normal(pgn):
     return '\n'.join(line.rstrip() for line in pgn.strip().splitlines() if line.strip())
 
 
-def check_games(events, games, reports, names=None, endings=None):
-    # Every uploaded game left the worker named and tagged, and reached nyayo once, as uploaded, after its match
+def players_and_tags(pgn):
+    # A game without the lines the worker or the backfill rewrites: the players and the fork's tags
+    return normal(re.sub(r'^\[(White|Black|Subject|Opponent) "[^"]*"\]$', '', pgn, flags=re.M))
 
-    # Returns (problems, how many games must have arrived); a batch uploaded while nyayo was
-    # down may be missing, since nothing resends it yet. names: (dev, base) as the match names them;
+
+def check_games(events, uploads, reports, names=None, endings=None):
+    # Every upload reached nyayo whole, after its match: the worker's own bytes, its games named and tagged.
+    # A backfilled upload from before client 39 (no Subject) goes renamed and tagged, compressed again.
+
+    # Returns (problems, how many games must have arrived); an upload while nyayo was down may be
+    # missing, since nothing resends it but the backfill. names: (dev, base) as the match names them;
     # endings: { game : cutechess's Termination, or None }, from the worker's own PGNs
 
-    problems, want, optional = [], {}, set()
+    problems, live, sends, optional, games = [], {}, collections.Counter(), set(), set()
     for event in events:
-        if event.kind == 'pgn':
-            batch = uploaded_games(event)
-            want.update(batch)
+        if event.kind in ('pgn', 'backfill-upload'):
+            name = upload_name(event)
+            sends[name] += 1
+            if event.kind == 'pgn':
+                live[name] = event
             if event.lost:
-                optional.update(batch)
+                optional.add(name)
+            else:
+                games.update(uploaded_games(event))
+    backfilled = { upload_name(x) : x for x in events if x.kind == 'backfill-upload' }
 
-    got     = collections.Counter(x['game'] for x in games)
-    missing = sorted(set(want) - set(got) - optional)
-    extra   = sorted(set(got) - set(want))
-    twice   = sorted(x for x, count in got.items() if count > 1)
-    if missing: problems.append('%d uploaded game(s) never reached nyayo: %s' % (len(missing), missing[:5]))
-    if extra:   problems.append('%d game(s) nobody uploaded: %s' % (len(extra), extra[:5]))
-    if twice:   problems.append('game(s) sent more than once: %s' % (twice[:5]))
+    got = collections.defaultdict(list)
+    for upload in uploads:
+        got[upload['upload']].append(upload)
 
-    # As the worker uploaded it: <engine> <branch>, dev's colour, the opponent, how it ended
-    for game, pgn in sorted(want.items()) if names else []:
-        tags = dict(re.findall(r'^\[(\w+) "([^"]*)"\]$', pgn, re.M))
-        dev, base = names
-        colour = tags.get('Subject')
-        if colour not in ('white', 'black'):
-            problems.append('uploaded game %s: Subject %r' % (game, colour))
-            continue
-        players = { 'White' : dev, 'Black' : base } if colour == 'white' else { 'White' : base, 'Black' : dev }
-        if { k : tags.get(k) for k in ('White', 'Black') } != players:
-            problems.append('uploaded game %s: players %s, expected %s' % (
-                game, { k : tags.get(k) for k in ('White', 'Black') }, players))
-        if tags.get('Opponent') != 'base':
-            problems.append('uploaded game %s: Opponent %r, expected base' % (game, tags.get('Opponent')))
-        if endings is not None and tags.get('Termination') != endings.get(game):
-            problems.append('uploaded game %s: Termination %r, cutechess wrote %r' % (
-                game, tags.get('Termination'), endings.get(game)))
+    missing = sorted(set(sends) - set(got) - optional)
+    extra   = sorted(set(got) - set(sends))
+    if missing: problems.append('%d upload(s) never reached nyayo: %s' % (len(missing), missing[:5]))
+    if extra:   problems.append('%d upload(s) nobody made: %s' % (len(extra), extra[:5]))
 
     first_report = min((x['t'] for x in reports), default=None)
-    for sent in games:
-        if sent['game'] not in want:
+    for name, copies in sorted(got.items()):
+        if name not in sends:
             continue
-        # The reporter renames and tags nothing a second time
-        if normal(sent['pgn']) != normal(want[sent['game']]):
-            problems.append('game %s: differs from the uploaded game' % (sent['game']))
-        if first_report is None or sent['t'] < first_report:
-            problems.append('game %s: sent before its match' % (sent['game']))
+        where = 'upload %s' % (name)
+        if len(copies) > sends[name]:
+            problems.append('%s: taken %d times, sent %d' % (where, len(copies), sends[name]))
+        if len({ x['sha256'] for x in copies }) > 1:
+            problems.append('%s: sent again with other bytes' % (where))
+        if any(first_report is None or x['t'] < first_report for x in copies):
+            problems.append('%s: sent before its match' % (where))
 
-    return problems, len(set(want) - optional)
+        # The worker's upload goes as it is, live and backfilled alike
+        sent  = copies[0]['data']
+        event = live.get(name) or backfilled[name]
+        if not event.old and sent != event.upload:
+            problems.append('%s: not the bytes the worker uploaded' % (where))
+        # An older one: its games as uploaded but for the players and the tags, in the worker's layout
+        if event.old:
+            before, after = list(uploaded_games(event).values()), split_upload(sent)
+            if [players_and_tags(x) for x in before] != [players_and_tags(x) for x in after]:
+                problems.append('%s: its games differ from the upload but for the players and the tags' % (where))
+            if sent == event.upload:
+                problems.append('%s: an upload from before client 39 sent unchanged' % (where))
+            if not bz2.decompress(sent).decode('utf-8').endswith('\n\n'):
+                problems.append("%s: not in the worker's layout" % (where))
+
+        # Named and tagged: <engine> <branch>, dev's colour, the opponent, how it ended
+        for number, pgn in enumerate(split_upload(sent) if names else [], 1):
+            game, tags = '%s.%d' % (name, number), dict(re.findall(r'^\[(\w+) "([^"]*)"\]$', pgn, re.M))
+            dev, base = names
+            colour = tags.get('Subject')
+            if colour not in ('white', 'black'):
+                problems.append('game %s: Subject %r' % (game, colour))
+                continue
+            players = { 'White' : dev, 'Black' : base } if colour == 'white' else { 'White' : base, 'Black' : dev }
+            if { k : tags.get(k) for k in ('White', 'Black') } != players:
+                problems.append('game %s: players %s, expected %s' % (
+                    game, { k : tags.get(k) for k in ('White', 'Black') }, players))
+            if tags.get('Opponent') != 'base':
+                problems.append('game %s: Opponent %r, expected base' % (game, tags.get('Opponent')))
+            if endings is not None and not event.old and tags.get('Termination') != endings.get(game):
+                problems.append('game %s: Termination %r, cutechess wrote %r' % (
+                    game, tags.get('Termination'), endings.get(game)))
+
+    return problems, len(games)
+
+
+def split_upload(data):
+    text = bz2.decompress(data).decode('utf-8').strip()
+    return [x.strip() for x in re.split(r'\n\s*\n(?=\[Event )', text) if x.strip()]
 
 
 def check_status_first(first, second, first_events, first_games, second_events, second_reports):

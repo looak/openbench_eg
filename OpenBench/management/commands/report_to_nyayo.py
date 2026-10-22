@@ -1,7 +1,7 @@
 from django.core.management.base import BaseCommand, CommandError
 
 from OpenBench.models import Test
-from OpenBench.nyayo import nyayo_enabled, report_test
+from OpenBench.nyayo import nyayo_enabled, report_test, report_uploads
 
 
 class Command(BaseCommand):
@@ -14,6 +14,9 @@ class Command(BaseCommand):
         parser.add_argument('--all', action='store_true', help='every test, oldest first')
         parser.add_argument('--schema', choices=['openbench', 'v1'], default=None,
                             help='the document to send, NYAYO_SCHEMA when left out; v1 moves a match to version 1')
+        parser.add_argument('--games', action='store_true',
+                            help='and every upload of each test again, from Media/PGNs/<test>.pgn.tar; one from '
+                                 'before client 39 is named and tagged first')
 
     def handle(self, *args, **options):
         if not nyayo_enabled():
@@ -29,9 +32,21 @@ class Command(BaseCommand):
             if unknown:
                 raise CommandError('no such test: %s' % (', '.join(map(str, unknown))))
 
-        failed = [test_id for test_id in ids if not report_test(test_id, options['schema'])]
+        failed = []
         for test_id in ids:
-            self.stdout.write('%s test %d' % ('failed' if test_id in failed else 'sent', test_id))
+            # The match first, so nyayo knows it before its uploads
+            if not report_test(test_id, options['schema']):
+                failed.append(test_id)
+                self.stdout.write('failed test %d' % (test_id))
+                continue
+            if not options['games']:
+                self.stdout.write('sent test %d' % (test_id))
+                continue
+            sent, refused = report_uploads(test_id, options['schema'])
+            if refused:
+                failed.append(test_id)
+            self.stdout.write('%s test %d, %d upload(s) sent, %d failed' % (
+                'failed' if refused else 'sent', test_id, sent, refused))
 
         if failed:
             raise CommandError('%d of %d test(s) failed, see the log above' % (len(failed), len(ids)))
