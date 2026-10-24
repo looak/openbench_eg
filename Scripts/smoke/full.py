@@ -5,6 +5,7 @@
 
 import collections
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -186,15 +187,21 @@ class NyayoServer:
             problems.append('nyayo has results %s, the Test has %s' % (rows, want))
         return problems
 
-    def check_games(self, match_id, count):
-        # nyayo indexed every game it took, with the subject's colour and the opponent known
-        rows = self.query('SELECT game, colour, opponent, result FROM matches_game WHERE match_id = ?', match_id)
+    def check_games(self, match_id, count, names):
+        # nyayo indexed every game it took, with the subject's colour, the opponent and both players placed
+        rows = self.query('SELECT game, colour, opponent, white, black FROM matches_game WHERE match_id = ?', match_id)
         problems = []
         if len(rows) != count:
             problems.append('nyayo has %d game(s) for the match, %d were sent' % (len(rows), count))
-        unknown = [x['game'] for x in rows if x['colour'] not in ('white', 'black') or not x['opponent']]
+        unknown = [x['game'] for x in rows if x['colour'] not in ('white', 'black') or x['opponent'] != 'base']
         if unknown:
             problems.append('nyayo could not place the players of %d game(s): %s' % (len(unknown), unknown[:5]))
+        dev, base = names
+        wrong = [x for x in rows if x['colour'] in ('white', 'black')
+                 and (x['white'], x['black']) != ((dev, base) if x['colour'] == 'white' else (base, dev))]
+        if wrong:
+            problems.append('nyayo has the players of %d game(s) as %s, expected %s' % (
+                len(wrong), [(x['game'], x['white'], x['black'], x['colour']) for x in wrong[:3]], (dev, base)))
         return problems
 
     def stop(self):
@@ -370,7 +377,7 @@ class Harness:
         return { 'dev' : rows[test['dev_id']], 'base' : rows[test['base_id']] }
 
     def player_names(self, test_id):
-        # v1 names a game's players <engine> <branch>
+        # The worker names a game's players <engine> <branch>, as the v1 match document does
         test, engines = self.test_row(test_id), self.engines(test_id)
         return ('%s %s' % (test['dev_engine'], engines['dev']['name']), '%s %s' % (test['base_engine'], engines['base']['name']))
 
@@ -475,12 +482,12 @@ class Harness:
         problems = self.expect.check(
             test_id, self.nyayo.for_test(test_id), self.test_row(test_id), self.results(test_id), engines,
             resends=len(self.nyayo.unknown_for_test(test_id)))
-        names    = self.player_names(test_id) if self.args.schema == 'v1' else None
-        problems += expect.check_games(
-            self.events(test_id), self.nyayo.games_for_test(test_id), self.nyayo.for_test(test_id), names)[0]
+        names    = self.player_names(test_id)
+        problems += expect.check_games(self.events(test_id), self.nyayo.games_for_test(test_id),
+                                       self.nyayo.for_test(test_id), names, self.endings(test_id))[0]
         if self.nyayo_server:
             problems += self.nyayo_server.check_games(
-                'openbench-%s-%d' % (NYAYO_INSTANCE, test_id), len(self.nyayo.games_for_test(test_id)))
+                'openbench-%s-%d' % (NYAYO_INSTANCE, test_id), len(self.nyayo.games_for_test(test_id)), names)
         problems += ['nyayo recorder: %s %s: %s' % (x['method'], x['path'], x['problem'])
                      for x in self.nyayo.violations if self.concerns(x['path'], test_id)]
         if self.nyayo_server and self.expect.expected(test_id):
@@ -491,6 +498,18 @@ class Harness:
                 test_id, list(self.recorder.log), self.expect.events, self.nyayo.for_test(test_id))))
 
     # Client side
+
+    def endings(self, test_id):
+        # cutechess's Termination of each game the worker played, from its own PGNs, as { game id : tag or None }:
+        # PGNs/<test>.<result>.<book index>.<time>.<copy>.pgn, the copies uploaded in order
+        endings, folder = {}, self.temp / 'Client' / 'PGNs'
+        files = sorted(folder.glob('%d.*.pgn' % (test_id)), key=lambda x: [int(n) for n in x.name.split('.')[:-1]])
+        for (result, book), group in itertools.groupby(files, lambda x: tuple(x.name.split('.')[1:3])):
+            games = re.split(r'\n\s*\n(?=\[Event )', '\n\n'.join(x.read_text().strip() for x in group))
+            for number, game in enumerate(games, 1):
+                found = re.search(r'^\[Termination "([^"]*)"\]', game, re.M)
+                endings['%s.%s.%d' % (result, book, number)] = found and found.group(1)
+        return endings
 
     def start_client(self):
         client = self.temp / 'Client'

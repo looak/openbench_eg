@@ -12,8 +12,9 @@
 #   bench_error  (clientBenchError)        error
 #   backfill (report_to_nyayo)             one report, the test as it stands
 #   pgn      (clientSubmitPGN)             no match report; one PUT .../games/<result>.<book_index>.<n> per
-#                                          game in the batch, the game as uploaded plus Subject and Opponent
-#                                          tags, after the match exists in nyayo
+#                                          game in the batch, the game as uploaded, after the match exists in
+#                                          nyayo. The worker uploads each game named <engine> <branch> and
+#                                          tagged Subject and Opponent "base", cutechess's Termination kept
 #
 # An event while nyayo is down has no report (lost); the next report carries the whole state.
 #
@@ -213,11 +214,12 @@ def normal(pgn):
     return '\n'.join(line.rstrip() for line in pgn.strip().splitlines() if line.strip())
 
 
-def check_games(events, games, reports, names=None):
-    # Every uploaded game reached nyayo once, unchanged but for the two tags, after its match
+def check_games(events, games, reports, names=None, endings=None):
+    # Every uploaded game left the worker named and tagged, and reached nyayo once, as uploaded, after its match
 
     # Returns (problems, how many games must have arrived); a batch uploaded while nyayo was
-    # down may be missing, since nothing resends it yet
+    # down may be missing, since nothing resends it yet. names: (dev, base) as the match names them;
+    # endings: { game : cutechess's Termination, or None }, from the worker's own PGNs
 
     problems, want, optional = [], {}, set()
     for event in events:
@@ -235,34 +237,33 @@ def check_games(events, games, reports, names=None):
     if extra:   problems.append('%d game(s) nobody uploaded: %s' % (len(extra), extra[:5]))
     if twice:   problems.append('game(s) sent more than once: %s' % (twice[:5]))
 
+    # As the worker uploaded it: <engine> <branch>, dev's colour, the opponent, how it ended
+    for game, pgn in sorted(want.items()) if names else []:
+        tags = dict(re.findall(r'^\[(\w+) "([^"]*)"\]$', pgn, re.M))
+        dev, base = names
+        colour = tags.get('Subject')
+        if colour not in ('white', 'black'):
+            problems.append('uploaded game %s: Subject %r' % (game, colour))
+            continue
+        players = { 'White' : dev, 'Black' : base } if colour == 'white' else { 'White' : base, 'Black' : dev }
+        if { k : tags.get(k) for k in ('White', 'Black') } != players:
+            problems.append('uploaded game %s: players %s, expected %s' % (
+                game, { k : tags.get(k) for k in ('White', 'Black') }, players))
+        if tags.get('Opponent') != 'base':
+            problems.append('uploaded game %s: Opponent %r, expected base' % (game, tags.get('Opponent')))
+        if endings is not None and tags.get('Termination') != endings.get(game):
+            problems.append('uploaded game %s: Termination %r, cutechess wrote %r' % (
+                game, tags.get('Termination'), endings.get(game)))
+
     first_report = min((x['t'] for x in reports), default=None)
     for sent in games:
         if sent['game'] not in want:
             continue
-        where = 'game %s' % (sent['game'])
-        pgn   = sent['pgn']
-        tags  = dict(re.findall(r'^\[(Subject|Opponent|White|Black) "([^"]*)"\]$', pgn, re.M))
-        bare  = re.sub(r'^\[(Subject|Opponent) "[^"]*"\]\n', '', pgn, flags=re.M)
-        sent_ = dict(re.findall(r'^\[(White|Black) "([^"]*)"\]$', want[sent['game']], re.M))
-        players = lambda text: re.sub(r'^\[(White|Black) "[^"]*"\]$', '', text, flags=re.M)
-
-        # The game as uploaded, but for the tags and, under v1, the players' names
-        if normal(players(bare) if names else bare) != normal(players(want[sent['game']]) if names else want[sent['game']]):
-            problems.append('%s: differs from the uploaded game' % (where))
-        colour = 'white' if sent_.get('White', '').endswith('-dev') else 'black'
-        if tags.get('Subject') != colour:
-            problems.append('%s: Subject %r, the dev engine plays %s' % (where, tags.get('Subject'), colour))
-        if names:
-            dev, base = names
-            want_names = { 'White' : dev, 'Black' : base } if colour == 'white' else { 'White' : base, 'Black' : dev }
-            if { k : tags.get(k) for k in ('White', 'Black') } != want_names:
-                problems.append('%s: players %s, expected %s' % (where, { k : tags.get(k) for k in ('White', 'Black') }, want_names))
-            if tags.get('Opponent') != 'base':
-                problems.append('%s: Opponent %r, expected base' % (where, tags.get('Opponent')))
-        elif not tags.get('Opponent'):
-            problems.append('%s: no Opponent tag' % (where))
+        # The reporter renames and tags nothing a second time
+        if normal(sent['pgn']) != normal(want[sent['game']]):
+            problems.append('game %s: differs from the uploaded game' % (sent['game']))
         if first_report is None or sent['t'] < first_report:
-            problems.append('%s: sent before its match' % (where))
+            problems.append('game %s: sent before its match' % (sent['game']))
 
     return problems, len(set(want) - optional)
 
