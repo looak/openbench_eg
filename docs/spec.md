@@ -26,7 +26,7 @@ the fork's additions and how it's deployed, and how other components read OpenBe
   `src/cli/src/openbench.cpp`; `ARCH` defaults to `native`.
 - **`<binary> bench`** on the command line prints `<nodes> nodes <nps> nps` as its last line. The node count must
   equal the `bench <nodes> nodes` line in the newest commit of the tested branch, or OpenBench flags the test. The
-  commit hook writes that line from the same makefile build (Elephant's spec, *Bench*).
+  commit hook writes that line from the same makefile build ([Elephant's spec, *Bench*](https://github.com/looak/elephant/blob/main/docs/spec/engine.md#bench)).
 - **UCI** with `Threads`, `Hash` and `Move Overhead`.
 
 ### The instance
