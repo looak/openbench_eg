@@ -3,8 +3,10 @@
 # and every report the server sends to nyayo checked against Scripts/smoke/expect.py.
 # Linux and WSL only. Run through Scripts/smoke_client_server.py --full.
 
+import bz2
 import collections
 import hashlib
+import io
 import itertools
 import json
 import math
@@ -16,6 +18,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -112,7 +115,8 @@ def find_free_port():
 class NyayoServer:
 
     # A real nyayo from a checkout (--nyayo PATH), its data in a temp directory, and a
-    # machine token for the reporter. The nyayo recorder forwards to it.
+    # machine token for the reporter. The nyayo recorder forwards to it. A nyayo with a
+    # worker (manage.py worker: uploads taken at once, read in the background) runs it too.
 
     def __init__(self, checkout, python, temp):
         self.checkout = Path(checkout).resolve()
@@ -120,7 +124,8 @@ class NyayoServer:
         self.data     = temp / 'nyayo'
         self.port     = find_free_port()
         self.url      = 'http://127.0.0.1:%d' % (self.port)
-        self.proc     = self.log = None
+        self.proc     = self.log = self.worker = self.worker_log = None
+        self.uploads  = (self.checkout / 'nyayo' / 'matches' / 'management' / 'commands' / 'worker.py').is_file()
 
         if not (self.checkout / 'manage.py').is_file() or not (self.checkout / 'nyayo').is_dir():
             raise SmokeFailure('%s is not a nyayo checkout' % (self.checkout))
@@ -132,6 +137,7 @@ class NyayoServer:
             'NYAYO_DEBUG'         : '1',
             'NYAYO_SECRET_KEY'    : 'openbench-smoke',
             'NYAYO_ALLOWED_HOSTS' : '127.0.0.1,localhost',
+            'NYAYO_SEAL_AFTER'    : '2',  # A match ended and quiet this long has its open batch sealed
         })
 
     def manage(self, *args):
@@ -152,6 +158,11 @@ class NyayoServer:
             [self.python, '-u', 'manage.py', 'runserver', '127.0.0.1:%d' % (self.port), '--noreload'],
             cwd=self.checkout, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.log = LogTail(self.proc.stdout, self.data.parent / 'nyayo.log')
+        if self.uploads:
+            self.worker = subprocess.Popen(
+                [self.python, '-u', 'manage.py', 'worker', '--interval', '0.2'],
+                cwd=self.checkout, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            self.worker_log = LogTail(self.worker.stdout, self.data.parent / 'nyayo-worker.log')
 
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -187,24 +198,78 @@ class NyayoServer:
             problems.append('nyayo has results %s, the Test has %s' % (rows, want))
         return problems
 
-    def check_games(self, match_id, count, names):
-        # nyayo indexed every game it took, with the subject's colour, the opponent and both players placed
-        rows = self.query('SELECT game, colour, opponent, white, black FROM matches_game WHERE match_id = ?', match_id)
+    def check_uploads(self, match_id, uploads):
+        # nyayo kept every upload it took, the bytes as sent (their sha256) and all their games
+        if self.uploads:
+            return self.check_put_away(match_id, uploads)
+        rows = { x['batch'] : x for x in self.query(
+            'SELECT batch, games, sha256 FROM matches_gamebatch WHERE match_id = ?', match_id) }
         problems = []
-        if len(rows) != count:
-            problems.append('nyayo has %d game(s) for the match, %d were sent' % (len(rows), count))
-        unknown = [x['game'] for x in rows if x['colour'] not in ('white', 'black') or x['opponent'] != 'base']
-        if unknown:
-            problems.append('nyayo could not place the players of %d game(s): %s' % (len(unknown), unknown[:5]))
-        dev, base = names
-        wrong = [x for x in rows if x['colour'] in ('white', 'black')
-                 and (x['white'], x['black']) != ((dev, base) if x['colour'] == 'white' else (base, dev))]
-        if wrong:
-            problems.append('nyayo has the players of %d game(s) as %s, expected %s' % (
-                len(wrong), [(x['game'], x['white'], x['black'], x['colour']) for x in wrong[:3]], (dev, base)))
+        for upload in { x['upload'] : x for x in uploads }.values():
+            row = rows.get(upload['upload'])
+            if row is None:
+                problems.append('nyayo has no upload %s' % (upload['upload']))
+            elif (row['sha256'], row['games']) != (upload['sha256'], upload['games']):
+                problems.append('nyayo has upload %s as %d game(s), sha256 %s; sent %d, %s' % (
+                    upload['upload'], row['games'], row['sha256'][:12], upload['games'], upload['sha256'][:12]))
+        extra = sorted(set(rows) - { x['upload'] for x in uploads })
+        if extra:
+            problems.append('nyayo has upload(s) nobody sent: %s' % (extra[:5]))
+        return problems
+
+    def check_put_away(self, match_id, uploads, timeout=30):
+        # nyayo's worker read every upload and kept its games: the upload done with the sha256 sent, a card
+        # per game placing both players (the subject's colour, the opponent) and the game as it came
+        sent = { x['upload'] : x for x in uploads }
+        pending = lambda: self.query("SELECT name FROM matches_upload WHERE match_id = ? AND state = 'pending'", match_id)
+        deadline = time.time() + timeout
+        while pending() and time.time() < deadline:
+            if self.worker.poll() is not None:
+                return ['nyayo\'s worker exited\n%s' % (self.worker_log.tail())]
+            time.sleep(0.25)
+
+        problems, rows = [], { x['name'] : x for x in self.query(
+            'SELECT name, sha256, state, reason, games, appended FROM matches_upload WHERE match_id = ?', match_id) }
+        for name, upload in sorted(sent.items()):
+            row = rows.get(name)
+            if row is None:
+                problems.append('nyayo has no upload %s' % (name))
+            elif row['state'] != 'done':
+                problems.append('nyayo has upload %s %s: %s' % (name, row['state'], row['reason']))
+            elif (row['sha256'], row['games'], row['appended']) != (upload['sha256'], upload['games'], upload['games']):
+                problems.append('nyayo has upload %s as %d game(s), %d kept, sha256 %s; sent %d, %s' % (
+                    name, row['games'], row['appended'], row['sha256'][:12], upload['games'], upload['sha256'][:12]))
+        extra = sorted(set(rows) - set(sent))
+        if extra:
+            problems.append('nyayo has upload(s) nobody sent: %s' % (extra[:5]))
+
+        # Its cards and the games as it keeps them, read through nyayo's own catalogue
+        output = self.manage('shell', '-c', (
+            'import json; from nyayo.matches import catalogue as c; '
+            'print("SMOKE_CARDS", json.dumps([{**x, "pgn": (c.read_game(%r, x["game"]) or b"").decode()} '
+            'for x in c.cards(%r)]))') % (match_id, match_id))
+        cards = { x['game'] : x for x in json.loads(output.split('SMOKE_CARDS', 1)[1]) }
+        games = { '%s.%d' % (name, n) : pgn for name, x in sent.items() for n, pgn in enumerate(expect.split_upload(x['data']), 1) }
+        for game, pgn in sorted(games.items()):
+            card = cards.get(game)
+            tags = dict(re.findall(r'^\[(\w+) "([^"]*)"\]$', pgn, re.M))
+            if card is None:
+                problems.append('nyayo has no card for game %s' % (game))
+                continue
+            if card['colour'] != tags.get('Subject') or card['opponent'] is None:
+                problems.append('nyayo places game %s as %s against %s, it says Subject %s' % (
+                    game, card['colour'] or 'nobody', card['opponent'], tags.get('Subject')))
+            if card['termination'] != tags.get('Termination', ''):
+                problems.append('nyayo has game %s ended by %r, it says %r' % (game, card['termination'], tags.get('Termination')))
+            if expect.normal(card['pgn']) != expect.normal(pgn):
+                problems.append('nyayo keeps game %s other than it was sent' % (game))
+        extra = sorted(set(cards) - set(games))
+        if extra:
+            problems.append('nyayo has card(s) for game(s) nobody sent: %s' % (extra[:5]))
         return problems
 
     def stop(self):
+        stop_process(self.worker)
         stop_process(self.proc)
 
 
@@ -398,7 +463,7 @@ class Harness:
                     event.upload     = entry.get('files', {}).get('file', b'')
                     event.result_id  = entry['form']['result_id']
                     event.book_index = entry['form']['book_index']
-                    event.lost       = self.nyayo_down  # Nothing resends a batch nyayo missed, yet
+                    event.lost       = self.nyayo_down  # Nothing resends an upload nyayo missed but the backfill
         return response
 
     def action(self, test_id, action, **fields):
@@ -436,22 +501,36 @@ class Harness:
         self.wait_for(lambda: uploaded() >= self.test_row(test_id)['games'], timeout,
                       'the worker to upload the games of test %d' % (test_id), soft=True)
 
-    def backfill(self, *args, schema=None):
-        # manage.py report_to_nyayo, recording a backfill event for each test it sends
+    def backfill(self, *args, schema=None, games=False):
+        # manage.py report_to_nyayo, recording a backfill event for each test it sends, and with
+        # games=True (--games) one for each upload it sends again from the test's tar
         self.settle_all()
         with self.lock:
             ids = [x['id'] for x in self.query('SELECT id FROM OpenBench_test ORDER BY id')] if '--all' in args \
                 else [int(x) for x in args]
             rows = { test_id : self.test_row(test_id) for test_id in ids }
-            extra = ['--schema', schema] if schema else []
+            extra = (['--schema', schema] if schema else []) + (['--games'] if games else [])
             result = subprocess.run([sys.executable, str(MANAGE), 'report_to_nyayo'] + extra + list(map(str, args)),
                                     cwd=ROOT, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             kind = 'backfill-v1' if schema == 'v1' else 'backfill'
             for test_id in ids:
                 self.expect.record(time.time(), kind, test_id, rows[test_id], self.test_row(test_id))
+                for result_id, book_index, data in (self.stored_uploads(test_id) if games else []):
+                    event = self.expect.record(time.time(), 'backfill-upload', test_id, rows[test_id], rows[test_id])
+                    event.upload, event.result_id, event.book_index = data, result_id, book_index
+                    event.old = b'[Subject "' not in bz2.decompress(data)
         if result.returncode:
             raise SmokeFailure('report_to_nyayo %s failed\n%s' % (' '.join(extra + list(map(str, args))), result.stdout[-2000:]))
         return result.stdout
+
+    def tar_path(self, test_id):
+        # Where the PGN watcher keeps a test's uploads, under the isolated server's MEDIA_ROOT
+        return self.temp / 'server' / 'Media' / 'PGNs' / ('%d.pgn.tar' % (test_id))
+
+    def stored_uploads(self, test_id):
+        # The test's uploads in its tar, in order, [(result id, book index, bytes)]
+        with tarfile.open(self.tar_path(test_id)) as tar:
+            return [(*x.name.split('.')[1:3], tar.extractfile(x).read()) for x in tar.getmembers()]
 
     def settle_all(self):
         for test_id in sorted({ x.test_id for x in self.expect.events }):
@@ -483,11 +562,11 @@ class Harness:
             test_id, self.nyayo.for_test(test_id), self.test_row(test_id), self.results(test_id), engines,
             resends=len(self.nyayo.unknown_for_test(test_id)))
         names    = self.player_names(test_id)
-        problems += expect.check_games(self.events(test_id), self.nyayo.games_for_test(test_id),
+        problems += expect.check_games(self.events(test_id), self.nyayo.uploads_for_test(test_id),
                                        self.nyayo.for_test(test_id), names, self.endings(test_id))[0]
         if self.nyayo_server:
-            problems += self.nyayo_server.check_games(
-                'openbench-%s-%d' % (NYAYO_INSTANCE, test_id), len(self.nyayo.games_for_test(test_id)), names)
+            problems += self.nyayo_server.check_uploads(
+                'openbench-%s-%d' % (NYAYO_INSTANCE, test_id), self.nyayo.uploads_for_test(test_id))
         problems += ['nyayo recorder: %s %s: %s' % (x['method'], x['path'], x['problem'])
                      for x in self.nyayo.violations if self.concerns(x['path'], test_id)]
         if self.nyayo_server and self.expect.expected(test_id):
@@ -797,7 +876,7 @@ def scenario_two_tests(h):
 
 
 def scenario_nyayo_busy(h):
-    # nyayo answers every game 503 (busy, Retry-After 1) twice before taking it: each is sent again, none lost
+    # nyayo answers every upload 503 (busy, Retry-After 1) twice before taking it: each is sent again, none lost
     test_id = h.create_test(test_mode='GAMES', max_games=4)
     h.nyayo.busy_games(test_id, 2)
     h.wait_for(lambda: h.test_row(test_id)['finished'], 60, 'test %d to finish' % (test_id))
@@ -805,11 +884,54 @@ def scenario_nyayo_busy(h):
     h.settle(test_id, timeout=30)
     h.verify(test_id)
 
-    games = h.nyayo.games_for_test(test_id)
-    busied = collections.Counter(x['game'] for x in h.nyayo.busied if x['test_id'] == test_id)
-    check(games and all(busied[x['game']] == 2 for x in games),
-          'not every game was answered 503 twice before it was taken: %s' % (dict(busied)))
-    return 'test %d: %d games, each sent again after two 503s' % (test_id, len(games))
+    uploads = h.nyayo.uploads_for_test(test_id)
+    busied  = collections.Counter(x['upload'] for x in h.nyayo.busied if x['test_id'] == test_id)
+    check(uploads and all(busied[x['upload']] == 2 for x in uploads),
+          'not every upload was answered 503 twice before it was taken: %s' % (dict(busied)))
+    return 'test %d: %d uploads, each sent again after two 503s' % (test_id, len(uploads))
+
+
+def old_style(data):
+    # An upload as a worker before client 39 made it: cutechess's <engine>-dev and <engine>-base,
+    # no Subject, Opponent or Termination
+    games = []
+    for pgn in expect.split_upload(data):
+        dev_white = re.search(r'^\[Subject "white"\]$', pgn, re.M) is not None
+        pgn = re.sub(r'^\[(Subject|Opponent|Termination) "[^"]*"\]\n', '', pgn, flags=re.M)
+        white, black = ('smoke-dev', 'smoke-base') if dev_white else ('smoke-base', 'smoke-dev')
+        pgn = re.sub(r'^\[White "[^"]*"\]$', '[White "%s"]' % (white), pgn, flags=re.M)
+        pgn = re.sub(r'^\[Black "[^"]*"\]$', '[Black "%s"]' % (black), pgn, flags=re.M)
+        games.append(pgn)
+    return bz2.compress(''.join(x + '\n\n' for x in games).encode())  # The worker's layout
+
+def scenario_backfill_games(h):
+    # report_to_nyayo --games: a test's uploads again from its tar, and one from before client 39 in it,
+    # sent renamed and tagged, the same bytes on a second backfill (nyayo's 200, not a 409)
+    test_id = h.create_test(test_mode='GAMES', max_games=4)
+    h.wait_for(lambda: h.test_row(test_id)['finished'], 60, 'test %d to finish' % (test_id))
+    h.verify(test_id)
+
+    live = h.events(test_id, 'pgn')
+    h.wait_for(lambda: h.tar_path(test_id).exists() and len(h.stored_uploads(test_id)) >= len(live), 40,
+               'the PGN watcher to move the uploads of test %d into its tar' % (test_id))
+    first = live[0]
+    older = old_style(first.upload)
+    with tarfile.open(h.tar_path(test_id), 'a') as tar:
+        info = tarfile.TarInfo('%d.%s.9999.pgn.bz2' % (test_id, first.result_id))
+        info.size = len(older)
+        tar.addfile(info, io.BytesIO(older))
+
+    h.backfill(test_id, games=True)
+    h.verify(test_id)
+    h.backfill(test_id, games=True)
+    h.verify(test_id)
+
+    name = '%s.9999' % (first.result_id)
+    sent = [x for x in h.nyayo.uploads_for_test(test_id) if x['upload'] == name]
+    check(len(sent) == 2 and sent[0]['sha256'] == sent[1]['sha256'] != hashlib.sha256(older).hexdigest(),
+          'the older upload was sent %d time(s), not twice with the same new bytes' % (len(sent)))
+    return 'test %d: %d uploads sent again twice, one from before client 39 named and tagged (%s)' % (
+        test_id, len(live), ', '.join(str(x['status']) for x in sent))
 
 
 SCENARIOS = collections.OrderedDict([
@@ -827,6 +949,7 @@ SCENARIOS = collections.OrderedDict([
     ('12', ('a match moves to v1',                scenario_move_to_v1)),
     ('13', ('two tests, status ahead of games',   scenario_two_tests)),
     ('14', ('nyayo busy for games (503)',         scenario_nyayo_busy)),
+    ('15', ('report_to_nyayo --games, an older upload', scenario_backfill_games)),
 ])
 
 # Not written yet, each waiting on the work named
@@ -896,6 +1019,8 @@ def main(args):
         finally:
             if nyayo:
                 if failed: print('\n---- nyayo log (tail; full log in %s) ----\n%s' % (nyayo.log.path, nyayo.log.tail()))
+                if failed and nyayo.worker_log:
+                    print('\n---- nyayo worker log (tail; full log in %s) ----\n%s' % (nyayo.worker_log.path, nyayo.worker_log.tail()))
                 nyayo.stop()
             harness.close(keep=args.keep or bool(failed))
 

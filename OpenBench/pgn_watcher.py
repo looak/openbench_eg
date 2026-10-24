@@ -27,6 +27,7 @@ import traceback
 
 from OpenBench.models import PGN
 
+from django.conf import settings
 from django.db import transaction, OperationalError
 from django.core.files.base import ContentFile
 from django.core.files.storage import FileSystemStorage
@@ -39,7 +40,8 @@ class PGNWatcher(threading.Thread):
 
     def process_pgn(self, pgn):
 
-        tar_path = FileSystemStorage('Media/PGNs').path('%d.pgn.tar' % (pgn.test_id))
+        # Under MEDIA_ROOT, where the uploads are, not the working directory (an isolated server's own)
+        tar_path = os.path.join(settings.MEDIA_ROOT, 'PGNs', '%d.pgn.tar' % (pgn.test_id))
         pgn_path = FileSystemStorage().path(pgn.filename())
 
         with transaction.atomic():
