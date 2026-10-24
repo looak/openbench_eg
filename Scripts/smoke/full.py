@@ -410,10 +410,14 @@ class Harness:
         return after
 
     def settle(self, test_id, timeout=15):
-        # Reports go through a queue on a background thread: wait until every expected one is in
+        # Reports go through a queue on a background thread: wait until every expected one is in,
+        # or one after the last event carries it (the reports between were superseded)
         want = lambda: len(self.expect.expected(test_id))
-        self.wait_for(lambda: len(self.nyayo.for_test(test_id)) >= want(), timeout,
-                      '%d report(s) for test %d' % (want(), test_id), soft=True)
+        def arrived():
+            reports, expected = self.nyayo.for_test(test_id), self.expect.expected(test_id)
+            return len(reports) >= len(expected) or (reports and expected[-1].t < reports[-1]['t']
+                                                     and expect.matches(expected[-1], reports[-1]))
+        self.wait_for(arrived, timeout, '%d report(s) for test %d' % (want(), test_id), soft=True)
         games = lambda: expect.check_games(self.events(test_id), [], [])[1]
         self.wait_for(lambda: len(self.nyayo.games_for_test(test_id)) >= games(), timeout,
                       '%d game(s) of test %d' % (games(), test_id), soft=True)
@@ -469,7 +473,8 @@ class Harness:
         self.settle(test_id)
         engines  = self.engines(test_id)
         problems = self.expect.check(
-            test_id, self.nyayo.for_test(test_id), self.test_row(test_id), self.results(test_id), engines)
+            test_id, self.nyayo.for_test(test_id), self.test_row(test_id), self.results(test_id), engines,
+            resends=len(self.nyayo.unknown_for_test(test_id)))
         names    = self.player_names(test_id) if self.args.schema == 'v1' else None
         problems += expect.check_games(
             self.events(test_id), self.nyayo.games_for_test(test_id), self.nyayo.for_test(test_id), names)[0]
@@ -743,6 +748,51 @@ def scenario_move_to_v1(h):
     return 'test %d moved to v1' % (test_id)
 
 
+def scenario_two_tests(h):
+    # Two tests at once, the first's games slow to send: the second's first report doesn't wait for them.
+    # The first's games are held in the recorder until the second's report arrives (each 3 s at most).
+    # The second's first report is its first results, as for a test made on the website.
+    dev, base = h.engine('dev'), h.engine('base')  # Shared, so the second test needs no build
+    first    = h.create_test(test_mode='GAMES', max_games=1000, dev=dev, base=base)
+    released = threading.Event()
+    h.nyayo.hold_games(first, released, 3)
+
+    try:
+        h.wait_for(lambda: h.events(first, 'pgn'), 60, 'test %d to upload a batch of games' % (first))
+        # The higher priority: the worker's next workload is the second's
+        second = h.create_test(test_mode='GAMES', max_games=4, dev=dev, base=base, priority=2)
+        h.wait_for(lambda: h.nyayo.for_test(second), 60, 'the first report of test %d' % (second))
+    finally:
+        released.set()
+
+    h.wait_for(lambda: h.test_row(second)['finished'], 60, 'test %d to finish' % (second))
+    h.action(first, 'STOP')  # Once the first's games are all in
+    h.wait_until_released(first)
+    problems = expect.check_status_first(first, second, h.events(first), h.nyayo.games_for_test(first),
+                                         h.events(second), h.nyayo.for_test(second))
+    check(not problems, '; '.join(problems))
+    h.verify(first)
+    h.verify(second)
+    return 'tests %d and %d: %s, then stopped at %s' % (
+        second, first, score(h.test_row(second)), score(h.test_row(first)))
+
+
+def scenario_nyayo_busy(h):
+    # nyayo answers every game 503 (busy, Retry-After 1) twice before taking it: each is sent again, none lost
+    test_id = h.create_test(test_mode='GAMES', max_games=4)
+    h.nyayo.busy_games(test_id, 2)
+    h.wait_for(lambda: h.test_row(test_id)['finished'], 60, 'test %d to finish' % (test_id))
+    h.wait_for_uploads(test_id)
+    h.settle(test_id, timeout=30)
+    h.verify(test_id)
+
+    games = h.nyayo.games_for_test(test_id)
+    busied = collections.Counter(x['game'] for x in h.nyayo.busied if x['test_id'] == test_id)
+    check(games and all(busied[x['game']] == 2 for x in games),
+          'not every game was answered 503 twice before it was taken: %s' % (dict(busied)))
+    return 'test %d: %d games, each sent again after two 503s' % (test_id, len(games))
+
+
 SCENARIOS = collections.OrderedDict([
     ('1',  ('GAMES test to max_games',          scenario_games_to_max)),
     ('2',  ('SPRT with wide bounds to a result', scenario_sprt_to_result)),
@@ -756,6 +806,8 @@ SCENARIOS = collections.OrderedDict([
     ('10', ('every game reaches nyayo',          scenario_pgns)),
     ('11', ('report_to_nyayo TEST_ID and --all',  scenario_backfill)),
     ('12', ('a match moves to v1',                scenario_move_to_v1)),
+    ('13', ('two tests, status ahead of games',   scenario_two_tests)),
+    ('14', ('nyayo busy for games (503)',         scenario_nyayo_busy)),
 ])
 
 # Not written yet, each waiting on the work named

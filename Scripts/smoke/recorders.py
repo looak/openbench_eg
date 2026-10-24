@@ -64,9 +64,11 @@ class Recorder:
         return handler.rfile.read(length) if length else b''
 
     @staticmethod
-    def respond(handler, status, body, content_type='application/json'):
+    def respond(handler, status, body, content_type='application/json', headers=None):
         handler.send_response(status)
         handler.send_header('Content-Type', content_type)
+        for name, value in (headers or {}).items():
+            handler.send_header(name, value)
         handler.send_header('Content-Length', str(len(body)))
         handler.end_headers()
         handler.wfile.write(body)
@@ -138,8 +140,10 @@ def parse_multipart(ctype, body):
 class NyayoRecorder(Recorder):
 
     # Stands in for nyayo. Without a target it answers like nyayo, 201 for a new match or
-    # game and 200 after; with one (a real nyayo) it forwards and passes nyayo's answer
-    # back, and any answer but 200 or 201 is a violation carrying nyayo's reason. Only an
+    # game and 200 after, 404 for a game of a match it doesn't have; with one (a real nyayo)
+    # it forwards and passes nyayo's answer back. Any answer but 200 or 201 is a violation
+    # carrying nyayo's reason, except a game's 404, which the reporter answers by sending
+    # the match first (kept in `unknown`), and a 503 asked for by busy_games. Only an
     # authorised PUT of a match or of one of its games is allowed:
     #   /api/matches/openbench-<instance>-<test id>               the match document, JSON
     #   /api/matches/openbench-<instance>-<test id>/games/<game>  one game's PGN
@@ -152,8 +156,23 @@ class NyayoRecorder(Recorder):
                                      % (re.escape(instance)))
         self.reports    = []
         self.games      = []
+        self.unknown    = []  # Games answered 404, their match not known yet: the reporter sends it, then the game
         self.violations = []
         self.seen       = set()
+        self.holds      = {}  # test id -> (event, seconds): its games wait for the event, at most that long
+        self.busy       = {}  # test id -> how many times each of its games is answered 503 before it's taken
+        self.busied     = []  # The 503s sent
+
+    def hold_games(self, test_id, until, longest):
+        # A slow game path for one test: each of its games waits for `until`, at most `longest` seconds
+        # (under the reporter's 5 s timeout, so none is lost)
+        with self.lock:
+            self.holds[test_id] = (until, longest)
+
+    def busy_games(self, test_id, times):
+        # nyayo busy with games: each game of the test is answered 503, Retry-After 1, `times` times first
+        with self.lock:
+            self.busy[test_id] = times
 
     def handle(self, handler, method):
         body  = self.read_body(handler)
@@ -187,7 +206,18 @@ class NyayoRecorder(Recorder):
                 self.violations.append({ 't' : time.time(), 'method' : method, 'path' : path, 'problem' : problem })
             return self.respond(handler, 400, json.dumps({ 'error' : problem }).encode())
 
-        key = (match.group(1), game)
+        key, received = (match.group(1), game), time.time()
+        if game:
+            with self.lock:
+                busy = sum(1 for x in self.busied if x['path'] == path) < self.busy.get(int(match.group(2)), 0)
+                if busy:
+                    self.busied.append({ 't' : received, 'test_id' : int(match.group(2)), 'game' : game, 'path' : path })
+            if busy:
+                return self.respond(handler, 503, b'busy, send it again', 'text/plain; charset=utf-8', { 'Retry-After' : '1' })
+        hold = game and self.holds.get(int(match.group(2)))
+        if hold:
+            hold[0].wait(hold[1])
+
         if self.target:
             try:
                 upstream = requests.put(self.target + path, data=body, timeout=10, headers={
@@ -197,20 +227,26 @@ class NyayoRecorder(Recorder):
             except requests.RequestException as error:
                 status, reply = 502, str(error).encode()
         else:
+            # As nyayo: a game of a match it doesn't have is a 404
             with self.lock:
-                status = 200 if key in self.seen else 201
-                self.seen.add(key)
+                if game and (match.group(1), None) not in self.seen:
+                    status = 404
+                else:
+                    status = 200 if key in self.seen else 201
+                    self.seen.add(key)
             reply = json.dumps({ 'id' : match.group(1) }).encode()
 
         with self.lock:
-            entry = { 't' : time.time(), 'test_id' : int(match.group(2)), 'status' : status }
-            if status not in (200, 201):
-                self.violations.append({ 't' : entry['t'], 'method' : method, 'path' : path,
-                                         'problem' : 'nyayo answered %d: %s' % (status, reply.decode(errors='replace')[:300]) })
-            if game:
+            entry = { 't' : time.time(), 'received' : received, 'test_id' : int(match.group(2)), 'status' : status }
+            if game and status == 404:
+                self.unknown.append({ **entry, 'game' : game })
+            elif game:
                 self.games.append({ **entry, 'game' : game, 'pgn' : body.decode(errors='replace') })
             else:
                 self.reports.append({ **entry, 'document' : document })
+            if status not in (200, 201, 404) or (status == 404 and not game):
+                self.violations.append({ 't' : entry['t'], 'method' : method, 'path' : path,
+                                         'problem' : 'nyayo answered %d: %s' % (status, reply.decode(errors='replace')[:300]) })
 
         self.respond(handler, status, reply, 'text/plain; charset=utf-8')
 
@@ -221,3 +257,7 @@ class NyayoRecorder(Recorder):
     def games_for_test(self, test_id):
         with self.lock:
             return [x for x in self.games if x['test_id'] == test_id]
+
+    def unknown_for_test(self, test_id):
+        with self.lock:
+            return [x for x in self.unknown if x['test_id'] == test_id]

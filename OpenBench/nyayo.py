@@ -1,4 +1,5 @@
 import bz2
+import collections
 import logging
 import queue
 import re
@@ -14,9 +15,43 @@ from OpenBench.models import LogEvent, Result, Test
 
 logger = logging.getLogger(__name__)
 
-REPORT_QUEUE = queue.Queue()
-REPORT_STOP = threading.Event()
-REPORT_THREAD = None
+
+class LatestQueue:
+
+    # The tests whose match is waiting to be sent, each once and in the order first queued. A test
+    # queued again while it waits keeps its place: its document is built when it's sent, so the
+    # report sent is the newest anyway.
+
+    def __init__(self):
+        self.order   = collections.deque()
+        self.waiting = set()
+        self.ready   = threading.Condition()
+
+    def put(self, test_id):
+        with self.ready:
+            if test_id not in self.waiting:
+                self.waiting.add(test_id)
+                self.order.append(test_id)
+                self.ready.notify()
+
+    def get(self, timeout):
+        with self.ready:
+            if not self.order and not self.ready.wait_for(lambda: self.order, timeout):
+                raise queue.Empty
+            test_id = self.order.popleft()
+            self.waiting.discard(test_id)
+            return test_id
+
+
+# Match reports and games each have their own queue and thread, so a test's status never waits
+# behind games, its own or another test's (ramani plans/live-updates.md, Status apart from games)
+REPORT_QUEUE = LatestQueue()
+GAME_QUEUE   = queue.Queue()
+REPORT_STOP  = threading.Event()
+REPORT_THREAD = GAME_THREAD = None
+
+# How long a game is sent again while nyayo answers 503 (busy), before it's given up and logged
+GAME_BUSY_LIMIT = 300
 
 
 def nyayo_enabled():
@@ -305,10 +340,10 @@ def enqueue_report(test_id):
 
 
 def enqueue_pgn(test_id, result_id, book_index, data):
-    # A worker's uploaded batch (.pgn.bz2), queued behind the match report of its results
+    # A worker's uploaded batch (.pgn.bz2), on the games' queue: in order, behind no report
     if not nyayo_enabled():
         return False
-    REPORT_QUEUE.put(('pgn', test_id, result_id, book_index, data))
+    GAME_QUEUE.put((test_id, result_id, book_index, data))
     return True
 
 
@@ -390,10 +425,10 @@ def report_pgn(test_id, result_id, book_index, data, schema=None):
             colour = subject_colour(tags)
             body   = tag_game(rename_players(tags, *names) if v1 else tags, moves, colour, opponent).encode('utf-8')
             try:
-                response = session.put(url, data=body, headers=headers, timeout=5)
+                response = put_game(session, url, body, headers)
                 # nyayo doesn't know the match (it was down for its reports): send it, then the game again
                 if response.status_code == 404 and report_test(test_id, schema):
-                    response = session.put(url, data=body, headers=headers, timeout=5)
+                    response = put_game(session, url, body, headers)
                 if refused(response):
                     logger.error('nyayo refused game %s of test %s: %s', game, test_id, refused(response))
                     continue
@@ -402,6 +437,23 @@ def report_pgn(test_id, result_id, book_index, data, schema=None):
                 logger.exception('OpenBench failed to report game %s of test %s to nyayo', game, test_id)
 
     return sent == len(games)
+
+
+def put_game(session, url, body, headers):
+    # A 503 is nyayo busy with games, never a refusal: sent again after its Retry-After, for as long
+    # as GAME_BUSY_LIMIT seconds of waiting. Games wait behind it, in order; reports don't.
+    waited = 0
+    while True:
+        response = session.put(url, data=body, headers=headers, timeout=5)
+        if response.status_code != 503 or waited >= GAME_BUSY_LIMIT or REPORT_STOP.is_set():
+            return response
+        try:
+            delay = min(max(float(response.headers.get('Retry-After', 1)), 0.1), 30)
+        except ValueError:
+            delay = 1
+        delay = min(delay, GAME_BUSY_LIMIT - waited)
+        REPORT_STOP.wait(delay)
+        waited += delay
 
 
 def report_test(test_id, schema=None):
@@ -440,21 +492,28 @@ def refused(response):
 def _report_loop():
     while not REPORT_STOP.is_set():
         try:
-            item = REPORT_QUEUE.get(timeout=1)
+            test_id = REPORT_QUEUE.get(timeout=1)
+        except queue.Empty:
+            continue
+        report_test(test_id)
+
+
+def _game_loop():
+    # A game whose match nyayo doesn't know yet has the match sent first, from this thread (report_pgn)
+    while not REPORT_STOP.is_set():
+        try:
+            item = GAME_QUEUE.get(timeout=1)
         except queue.Empty:
             continue
 
         try:
-            if isinstance(item, tuple) and item[0] == 'pgn':
-                report_pgn(*item[1:])
-            else:
-                report_test(item)
+            report_pgn(*item)
         finally:
-            REPORT_QUEUE.task_done()
+            GAME_QUEUE.task_done()
 
 
 def start_report_loop():
-    global REPORT_THREAD
+    global REPORT_THREAD, GAME_THREAD
 
     if not nyayo_enabled():
         return None
@@ -464,7 +523,9 @@ def start_report_loop():
 
     REPORT_STOP.clear()
     REPORT_THREAD = threading.Thread(target=_report_loop, name='nyayo-report-loop', daemon=True)
+    GAME_THREAD   = threading.Thread(target=_game_loop, name='nyayo-game-loop', daemon=True)
     REPORT_THREAD.start()
+    GAME_THREAD.start()
     return REPORT_THREAD
 
 
