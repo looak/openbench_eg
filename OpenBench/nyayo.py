@@ -105,6 +105,23 @@ def build_match_document(test, schema=None):
     return build_openbench_document(test)
 
 
+def ended_at(test, state, rows):
+    # When a test that isn't running ended. One that passes, fails or runs out of games ends inside
+    # update_test with no event, on the result that tipped it (later ones are refused), so at its newest
+    # result; one stopped or deleted by hand at its newest STOP or DELETE; a bench error at its event.
+    # Not the newest event: that may be the CREATE, or a worker's crash in the middle of the run.
+    events = LogEvent.objects.filter(test_id=test.id).order_by('-id')
+    if state == 'finished':
+        event = None
+    elif state == 'error':
+        event = events.exclude(machine_id=0).filter(log_file='').first()
+    else:
+        event = events.filter(machine_id=0, summary__in=['STOP', 'DELETE']).first()
+    if event:
+        return event.created
+    return max((row.updated for row in rows), default=None) or test.updated
+
+
 def iso(when):
     return when.isoformat().replace('+00:00', 'Z') if when else None
 
@@ -133,10 +150,7 @@ def build_v1_document(test):
     state, sprt_result = match_state(test)
     openbench_url      = getattr(settings, 'NYAYO_OPENBENCH_URL', '').strip().rstrip('/')
 
-    finished_at = None
-    if state != 'running':
-        event       = LogEvent.objects.filter(test_id=test.id).order_by('-id').first()
-        finished_at = iso(event.created if event else test.updated)
+    finished_at = iso(ended_at(test, state, rows)) if state != 'running' else None
 
     sprt = stats = None
     if test.test_mode == 'SPRT':
