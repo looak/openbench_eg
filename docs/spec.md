@@ -53,6 +53,11 @@ stale value once stretched 8+0.08 to roughly 42+0.42. The bench uses one 16 MB T
 isn't dominated by page faults when a worker benches many copies at once: about 4.4M nps alone, 2.85M per copy at 16
 copies (1.0.0).
 
+Elephant is the only engine the create page offers (`Config/config.json`, `engines`): every test here is Elephant
+against Elephant, and gauntlets against other engines are played by uwanja. The other engines' `Engines/*.json` files
+stay so upstream merges stay clean; one is offered again by listing it. `Engines/elephant.json` defaults a test's book
+to `8moves_v3.epd` (`book_name`).
+
 ### Testing workflow
 
 - **One change per branch**, SPRT'd against a fixed base for the cycle (e.g. 0.15.2 for the herd cycle), at 8+0.08.
@@ -116,6 +121,10 @@ this section says when OpenBench sends what.
 - **When**: one match document after every batch of results (once the batch is in both the `Test` and its `Result`
   row), every bench error and every action by hand (approve, stop, delete, restore, modify). Each upload of games
   follows its workload's last results.
+- **When a test ended** (`finished_at` of a match that isn't running): a test that passes, fails or runs out of games
+  ends inside OpenBench's `update_test` with no event, so it ends at its newest result (later results are refused); a
+  test stopped or deleted by hand at its newest `STOP` or `DELETE` event; a bench error at the worker's event. Never
+  at the newest event of any kind, which can be the test's `CREATE` or a worker's crash in the middle of the run.
 - **How**: two queues, each drained by its own background thread, so a slow or absent nyayo never slows a worker and a
   test's status never waits for games:
 
