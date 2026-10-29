@@ -17,3 +17,11 @@ decisions), and `plans/` for work spanning repos. **Read ramani, never edit it**
 pull request that does a plan's step says `Closes looak/<repo>#<sub-issue>`. When it settles one of ramani's open
 decisions, say so in the final report. This repo owns no contract: it consumes nyayo's match schema
 (`docs/match-schema.md` in nyayo), which is changed only there, by agreement with the owner.
+
+## Workflow
+
+How work is tracked here (issues per repo on a release milestone, plans for cross-repo work, at most three
+issues in progress, an SPRT before a strength change merges) is in ramani's `WORKFLOW.md`. Read it before
+starting work; don't copy it. It is at `../ramani/WORKFLOW.md` in a sibling checkout; from a worktree, or if
+that is missing, read it with `gh api repos/looak/ramani/contents/WORKFLOW.md -q .content | base64 -d`. If
+neither works, say so in your report and don't guess the rules.
