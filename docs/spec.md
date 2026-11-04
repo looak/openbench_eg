@@ -118,6 +118,31 @@ Upstream, plus:
 | the full smoke test | `Scripts/smoke_client_server.py`, `Scripts/smoke/` |
 | unit tests | `UnitTests/` (`test_game_names.py`, `test_steps.py`, `test_names.py`, `test_verdict.py`, `test_client_retry.py`, `test_migrations.py`, `test_workload_kinds.py`: scripts, run from `UnitTests/`) |
 
+### How a worker registers
+
+A worker has no username or password (ramani's `plans/nyayo-2.md`, *Worker registration*; the server's half is nyayo's).
+`client.py --server URL [--join CODE]` (`OPENBENCH_SERVER` for the URL); `-T`, `-N`, `-I` and the rest are the worker's, as before.
+`Client/worker.py` and `Client/client.py` keep to this, and the server must answer the same:
+
+| Call | Sends | Answer |
+|:--|:--|:--|
+| `clientHello` | `name` (`-I`, else the host name), `host`, `client_ver`, `join` if given, `token` if it has one | `{token, approved}`, or `{error}` (a refused worker ends: a bad code, turned away) |
+| `clientMatchRunnerVersionRef` | `token`, `os_name`, `arch` | as before, and `binary: {url, sha256}` for the system if the server has one (`url` relative to the server or absolute, a bare executable or a `.tar`/`.zip` of the release holding it) |
+| `clientWorkerInfo` | `token`, `system_info` (with `toolchains` after a describe job) | `{machine_id, secret}` for the session, as before |
+| `clientGetWorkload` | `token`, `machine_id`, `secret`, `blacklist` | a workload, or `{describe: [tools]}`, or `{wait: reason}` |
+| every other call, and a network download | `token` | as before |
+
+- The token is kept in `Client/worker.token`, readable by its user only, and a restart sends it again. `clientVersionRef` needs
+  no credentials. The update of the client copies every file of the new `Client/` except `client.py` and `worker.token`.
+- `{describe: [tools]}`: the worker finds each tool's version with `get_version` (`null` when it won't run), then sends
+  `clientWorkerInfo` again with `toolchains: {tool: version or null}` in `system_info`. `{wait: reason}`: the reason is printed
+  once, and the worker asks again after `TIMEOUT_WORKLOAD`, so an approval needs no restart.
+- Fastchess: an existing `fastchess-ob` that is new enough is kept. Else the `binary` the server names is downloaded, its sha256
+  checked, made executable and asked for its version (which must satisfy `fastchess_min_version`), and becomes `fastchess-ob`.
+  Only without a binary, or when the checksum fails or it won't run, it is built from source, which needs `make` and a C++
+  compiler. A worker without them starts anyway and says so; it fails only when it has neither.
+- `clientGetBuildInfo` (compilers and CPU flags per engine) is still asked, and a server that has none is not an error.
+
 ### What the worker tells the server about itself
 
 `gpus`, a list of strings in `system_info`, sent to `clientWorkerInfo`: `lspci`'s VGA and 3D controllers on Linux (under

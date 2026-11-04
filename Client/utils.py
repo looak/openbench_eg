@@ -85,8 +85,8 @@ class OpenBenchMisssingPGNException(Exception):
         super().__init__(self.message)
 
 class OpenBenchMatchRunnerBuildFailedException(Exception):
-    def __init__(self):
-        self.message = ''
+    def __init__(self, message=''):
+        self.message = message
         super().__init__(self.message)
 
 
@@ -137,12 +137,18 @@ def credentialed_cmdline_args(parser=None):
 
     return args
 
-def credentialed_request(server, username, password, endpoint):
+def token_request(server, token, endpoint):
 
     target  = url_join(server, *endpoint.split('/'))
     payload = { 'username' : username, 'password' : password }
 
     return requests.post(data=payload, url=target)
+
+def token_request(server, token, endpoint):
+
+    # A call of a registered worker, which the server knows by its token
+    target = url_join(server, *endpoint.split('/'))
+    return requests.post(data={ 'token' : token }, url=target)
 
 def read_git_credentials(engine):
     fname = 'credentials.%s' % (engine.replace(' ', '').lower())
@@ -238,7 +244,7 @@ def download_opening_book(book_sha, book_source, book_name):
         os.remove(book_path)
         raise OpenBenchCorruptedBookException('Invalid sha for %s' % (book_name))
 
-def download_network(server, username, password, engine, net_name, net_sha, net_path):
+def download_network(server, token, engine, net_name, net_sha, net_path):
 
     # Avoid redownloading Network files
     if not os.path.isfile(net_path):
@@ -246,7 +252,7 @@ def download_network(server, username, password, engine, net_name, net_sha, net_
         # Format the API request, including credentials
         print ('Fetching %s (%s) for %s' % (net_name, net_sha, engine))
         endpoint = 'api/networks/%s/%s%s' % (engine, net_sha, '/compressed' if zstandard else '')
-        request  = credentialed_request(server, username, password, endpoint)
+        request  = token_request(server, token, endpoint)
 
         # The server falls back to the original file, so check what we received
         decompressor = None

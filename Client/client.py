@@ -38,6 +38,27 @@ def url_join(*args):
     # Join a set of URL paths while maintaining the correct format
     return '/'.join([f.lstrip('/').rstrip('/') for f in args]) + '/'
 
+# The worker's token, kept beside the client. An update of the client must never remove or overwrite it
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker.token')
+
+def read_token():
+
+    # The token this worker was given by the server, or None
+    try:
+        with open(TOKEN_FILE) as fin:
+            return fin.read().strip() or None
+    except OSError:
+        return None
+
+def save_token(token):
+
+    # Readable by this user only, from the moment it exists
+    descriptor = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, 'w') as fout:
+        fout.write(token)
+    try: os.chmod(TOKEN_FILE, 0o600)
+    except OSError: pass
+
 def try_forever(func, args, message, timeout=15):
 
     # Execute func(arg1, arg2, ...) until success
@@ -80,14 +101,10 @@ def custom_help(default_help):
 
 def parse_arguments():
 
-    # We can use ENV variables for the Username, Passwords, and Servers
-    req_user   = 'OPENBENCH_USERNAME' not in os.environ
-    req_pass   = 'OPENBENCH_PASSWORD' not in os.environ
-    req_server = 'OPENBENCH_SERVER'   not in os.environ
-
-    help_user   = 'Username. May also be provided via OPENBENCH_USERNAME environment variable'
-    help_pass   = 'Password. May also be provided via OPENBENCH_PASSWORD environment variable'
+    # The server may come from the environment. No credentials: a worker says hello and is given a token
+    req_server  = 'OPENBENCH_SERVER' not in os.environ
     help_server = 'Server URL. May also be provided via OPENBENCH_SERVER environment variable'
+    help_join   = 'One-time code from the Machines page, to be approved on hello'
 
     # Pretty formatting
     p = argparse.ArgumentParser(
@@ -96,9 +113,8 @@ def parse_arguments():
     )
 
     # Create and parse all arguments into a raw format
-    p.add_argument('-U', '--username'           , help=help_user                , required=req_user  )
-    p.add_argument('-P', '--password'           , help=help_pass                , required=req_pass  )
     p.add_argument('-S', '--server'             , help=help_server              , required=req_server)
+    p.add_argument(      '--join'               , help=help_join                                     )
     p.add_argument(      '--clean'              , help='Force New Client'       , action='store_true')
     p.add_argument(      '--no-client-downloads', help='NEVER download a client', action='store_true')
 
@@ -107,18 +123,26 @@ def parse_arguments():
 
     # Replace with ENV variables if needed
     args, unknown = p.parse_known_args()
-    args.username = args.username if args.username else os.environ['OPENBENCH_USERNAME']
-    args.password = args.password if args.password else os.environ['OPENBENCH_PASSWORD']
-    args.server   = args.server   if args.server   else os.environ['OPENBENCH_SERVER'  ]
+    args.server   = args.server   if args.server   else os.environ['OPENBENCH_SERVER']
 
     return args
 
+def copy_client_files(client_dir, dest_dir):
+
+    # Everything of the extracted Client except client.py, which is running, and the token, which is this worker's
+    copied_files = 0
+    for root, dirs, files in os.walk(client_dir):
+        for file in files:
+            if file not in ('client.py', 'worker.token'):
+                shutil.copy2(os.path.join(root, file), os.path.join(dest_dir, file))
+                copied_files += 1
+    return copied_files
+
 def download_client_files(args):
 
-    try: # Reponse may contain an error header for invalid credentials
-        payload     = { 'username' : args.username, 'password' : args.password }
+    try: # Needs no credentials
         target      = url_join(args.server, 'clientVersionRef')
-        version_ref = requests.post(target, data=payload).json()
+        version_ref = requests.post(target).json()
 
     except:
         raise Exception('Unable to retrieve Client Version from OpenBench server')
@@ -157,15 +181,7 @@ def download_client_files(args):
                 if len(client_dirs) != 1:
                     raise Exception('Unable to locate extracted Client directory in archive')
 
-                copied_files = 0
-                client_dir = client_dirs[0]
-                for root, dirs, files in os.walk(client_dir):
-                    for file in files:
-                        if file != 'client.py':
-                            shutil.copy2(os.path.join(root, file), os.path.join(os.getcwd(), file))
-                            copied_files += 1
-
-                if copied_files == 0:
+                if copy_client_files(client_dirs[0], os.getcwd()) == 0:
                     raise Exception('Client archive contained no updatable files')
 
     except:

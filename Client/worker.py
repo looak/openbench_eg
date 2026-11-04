@@ -19,6 +19,8 @@
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
 import argparse
+import hashlib
+import io
 import cpuinfo
 import importlib
 import json
@@ -33,6 +35,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -58,6 +61,8 @@ import utils
 from client import BadVersionException
 from client import url_join
 from client import try_forever
+from client import read_token
+from client import save_token
 
 ## Basic configuration of the Client. These timeouts can be changed at will
 
@@ -101,6 +106,10 @@ class Configuration:
         self.blacklist      = {} # Test id : when to try it again (time.time())
         self.answer         = {} # What the server answered a step that ended: stop, or retry_after
 
+        self.token          = read_token() # Given by the server on hello, kept in worker.token
+        self.toolchains     = {}           # Tool: its version or None, as the server asked in the describe job
+        self.last_wait      = None         # The last reason the server gave for waiting, printed once
+
         self.process_args(args)   # Rest of the command line settings
         self.check_requirements() # Checks for Make, and g++ or clang++
         self.init_client()        # Create folder structure and verify Syzygy
@@ -109,9 +118,8 @@ class Configuration:
     def process_args(self, args):
 
         # Extract all of the options
-        self.username    = args.username
-        self.password    = args.password
         self.server      = args.server
+        self.join        = args.join if getattr(args, 'join', None) else None
         self.threads     = int(args.threads) if args.threads != 'auto' else self.physical_cores
         self.sockets     = int(args.nsockets)
         self.identity    = args.identity if args.identity else 'None'
@@ -124,19 +132,17 @@ class Configuration:
 
     def check_requirements(self):
 
-        # Verify that we have make installed
-        print('\nLooking for Make... [v%s]' % locate_utility('make'))
-
-        # Look for either g++ or clang++
+        # Report what is missing. Fastchess comes from the server as a binary, so none of it stops the worker
+        make_ver      = locate_utility('make', force_exit=False, report_error=False)
         gcc_ver       = locate_utility('g++', force_exit=False, report_error=False)
         clang_ver     = locate_utility('clang++', force_exit=False, report_error=False)
         self.cxx_comp = 'g++' if gcc_ver else 'clang++' if clang_ver else None
-        print('Looking for C++ Compiler... [%s v%s]' % (self.cxx_comp, locate_utility(self.cxx_comp)))
 
-        # Cannot build fastchess nor observe CPU flags
-        if not self.cxx_comp:
-            print ('[Error] Unable to locate C++ Compiler (g++ or clang++)')
-            sys.exit()
+        print('\nLooking for Make... [%s]' % ('v%s' % make_ver if make_ver else 'missing'))
+        print('Looking for C++ Compiler... [%s]' % ('%s v%s' % (self.cxx_comp, gcc_ver or clang_ver) if self.cxx_comp else 'missing'))
+
+        if not (make_ver and self.cxx_comp):
+            print('[Note] Without Make and a C++ compiler this worker can not build; it can only run what the server gives it')
 
     def init_client(self):
 
@@ -240,7 +246,7 @@ class Configuration:
         print('\nDetermining ISA...')
 
         # Match the machine to a Stockfish-style ISA using our C++ compiler
-        self.isa_name = isa_detector.detect_isa(self.cxx_comp)
+        self.isa_name = isa_detector.detect_isa(self.cxx_comp) if self.cxx_comp else 'Unknown'
         print('Found   | %s' % (self.isa_name))
 
     def determine_huge_pages(self):
@@ -297,6 +303,7 @@ class ServerReporter:
 
         payload['machine_id'] = config.machine_id
         payload['secret']     = config.secret_token
+        payload['token']      = config.token
 
         target   = utils.url_join(config.server, endpoint)
         response = requests.post(target, data=payload, files=files, timeout=TIMEOUT_HTTP)
@@ -1025,7 +1032,7 @@ def server_configure_match_runner(config, name, build_func):
     print ('\nConfiguring %s...' % name)
     print ('> Requesting %s configuration from openbench' % name)
     target  = url_join(config.server, 'clientMatchRunnerVersionRef')
-    payload = { 'username' : config.username, 'password' : config.password }
+    payload = { 'token' : config.token, 'os_name' : platform.system(), 'arch' : platform.machine() }
     data    = requests.post(target, data=payload, timeout=TIMEOUT_HTTP).json()
 
     # Might already have a sufficiently new Fastchess binary
@@ -1038,6 +1045,13 @@ def server_configure_match_runner(config, name, build_func):
         print ('> Found %s-ob v%s' % (name, acceptable_ver))
         setattr(config, '%s_ver' % name, acceptable_ver)
         return
+
+    # The server may hold a binary for this system, which needs no compiler
+    if data.get('binary') and download_match_runner_binary(config, name, data):
+        return
+
+    if not (config.cxx_comp and locate_utility('make', force_exit=False, report_error=False)):
+        raise utils.OpenBenchMatchRunnerBuildFailedException('No %s binary from the server, and no Make and C++ compiler to build it' % name)
 
     # Download a .zip archive of the git-ref from the specified repo
     repo_url, repo_ref = data['%s_repo_url' % name], data['%s_repo_ref' % name]
@@ -1064,7 +1078,7 @@ def server_configure_match_runner(config, name, build_func):
 
         # Somehow we built runner but failed to find the binary
         if not utils.check_for_engine_binary(bin_path):
-            raise OpenBenchMatchRunnerBuildFailedException()
+            raise utils.OpenBenchMatchRunnerBuildFailedException()
 
         # Append .exe if needed, and then report the match runner version that was built
         binary  = utils.check_for_engine_binary(bin_path)
@@ -1075,6 +1089,54 @@ def server_configure_match_runner(config, name, build_func):
         # Move the finished match runner binary to the Client's Root directory
         out_path = os.path.join(os.getcwd(), os.path.basename(binary).replace(name, '%s-ob' % name))
         shutil.move(binary, out_path)
+
+def download_match_runner_binary(config, name, data):
+
+    # The binary the server names for this system: fetched, checked against its sha256, made executable and asked
+    # for its version. Anything wrong is a False, and the caller builds from source instead.
+    binary = data['binary']
+    path   = os.path.join(os.getcwd(), '%s-ob%s' % (name, ['', '.exe'][IS_WINDOWS]))
+    part   = path + '.part'
+
+    try:
+        print ('> Downloading the %s binary from the server' % name)
+        response = requests.get(binary['url'] if '://' in binary['url'] else url_join(config.server, binary['url']), timeout=TIMEOUT_HTTP)
+        assert response.status_code == 200, 'status %d' % (response.status_code)
+
+        if hashlib.sha256(response.content).hexdigest().lower() != binary['sha256'].lower():
+            raise Exception('checksum does not match')
+
+        # A release's own file is an archive holding the executable; the server may serve either
+        content = response.content
+        wanted  = '%s%s' % (name, ['', '.exe'][IS_WINDOWS])
+        if binary['url'].endswith('.zip'):
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                member  = next(x for x in archive.namelist() if os.path.basename(x) == wanted)
+                content = archive.read(member)
+        elif '.tar' in binary['url']:
+            with tarfile.open(fileobj=io.BytesIO(content)) as archive:
+                member  = next(x for x in archive.getmembers() if x.isfile() and os.path.basename(x.name) == wanted)
+                content = archive.extractfile(member).read()
+
+        with open(part, 'wb') as fout:
+            fout.write(content)
+        os.chmod(part, 0o755)
+
+        version = get_version(part) # Won't run, or no version: an exception
+        minimum = data.get('%s_min_version' % name)
+        if minimum and not compare_versions(part, minimum):
+            raise Exception('v%s is older than v%s' % (version, minimum))
+
+        os.replace(part, path)
+        setattr(config, '%s_ver' % name, version)
+        print ('> Using the downloaded %s-ob v%s' % (name, version))
+        return True
+
+    except Exception as error:
+        print ('> The %s binary from the server is no use: %s' % (name, error))
+        try: os.remove(part)
+        except OSError: pass
+        return False
 
 def build_fastchess_in_dir(config, runner_dir):
     print ('> Using C++ compiler %s...' % config.cxx_comp)
@@ -1089,13 +1151,52 @@ def build_fastchess_in_dir(config, runner_dir):
         print ('\nFailed to build fastchess\n\nCompiler Output:')
         for line in comp_output.split('\n'):
             print ('> %s' % (line))
-        raise OpenBenchMatchRunnerBuildFailedException()
+        raise utils.OpenBenchMatchRunnerBuildFailedException()
+
+def server_hello(config):
+
+    # Say hello to the server, with no credentials: it answers a token, which this worker keeps in worker.token
+    # and sends with every call. A token it has already is sent along, and answered again if the server knows it.
+    payload = { 'name' : config.identity if config.identity != 'None' else platform.node(), 'client_ver' : CLIENT_VERSION, 'host' : platform.node() }
+    if config.token: payload['token'] = config.token
+    if config.join : payload['join']  = config.join
+
+    target   = utils.url_join(config.server, 'clientHello')
+    response = requests.post(target, data=payload, timeout=TIMEOUT_HTTP).json()
+
+    if 'Bad Client Version' in response.get('error', ''):
+        raise BadVersionException()
+
+    # Refused (a bad join code, or turned away): trying again would change nothing
+    if 'error' in response:
+        print('[Error] The server refused this worker: %s' % (response['error']))
+        sys.exit(1)
+
+    config.token = response['token']
+    if config.token != read_token():
+        save_token(config.token)
+    print('Registered with the server%s' % ('' if response.get('approved') else ' (waiting for approval)'))
+
+def server_describe(config, tools):
+
+    # The describe job: the version of each tool the server named, or None, with the system info we already send
+    print('\nThe server asked about %s' % (', '.join(tools)))
+    config.toolchains = {}
+    for tool in tools:
+        try: config.toolchains[tool] = get_version(tool)
+        except Exception: config.toolchains[tool] = None
+        print('%-8s | %s' % (tool, config.toolchains[tool] or 'Missing'))
+
+    server_register_system(config)
 
 def server_configure_worker(config):
 
-    # Server tells us how to build or obtain binaries
+    # Server tells us how to build or obtain binaries. Best effort: a server that no longer does falls back on the
+    # tools alone, and the CPU flags we know of
     target = utils.url_join(config.server, 'clientGetBuildInfo')
-    data   = requests.get(target, timeout=TIMEOUT_HTTP).json()
+    try: data = requests.get(target, timeout=TIMEOUT_HTTP).json()
+    except Exception: data = {}
+    if 'error' in data: data = {}
 
     config.scan_for_compilers(data)      # Public engine build tools
     config.scan_for_private_tokens(data) # Private engine access tokens
@@ -1104,8 +1205,13 @@ def server_configure_worker(config):
     config.determine_huge_pages()        # Transparent Huge Pages mode of this machine
     config.machine_id = None             # None, until registration occurs for a session
 
+    server_register_system(config)
+
+def server_register_system(config):
+
     system_info = {
         'compilers'      : config.compilers,      # Key: Engine, Value: (Compiler, Version)
+        'toolchains'     : config.toolchains,     # Key: Tool, Value: its version or None, as the describe job asked
         'tokens'         : config.git_tokens,     # Key: Engine, Value: True, for tokens we have
         'cpu_flags'      : config.cpu_flags,      # List of CPU flags found in the Client or Server
         'cpu_name'       : config.cpu_name,       # Raw CPU name as per py-cpuinfo
@@ -1134,8 +1240,7 @@ def server_configure_worker(config):
     }
 
     payload = {
-        'username'    : config.username,
-        'password'    : config.password,
+        'token'       : config.token,
         'system_info' : json.dumps(system_info),
     }
 
@@ -1177,7 +1282,7 @@ def server_request_workload(config):
 
     print('\nRequesting Workload from Server...')
 
-    payload  = { 'machine_id' : config.machine_id, 'secret' : config.secret_token, 'blacklist' : blacklisted(config) }
+    payload  = { 'machine_id' : config.machine_id, 'secret' : config.secret_token, 'token' : config.token, 'blacklist' : blacklisted(config) }
     target   = utils.url_join(config.server, 'clientGetWorkload')
     response = requests.post(target, data=payload, timeout=TIMEOUT_HTTP)
 
@@ -1189,6 +1294,21 @@ def server_request_workload(config):
     # Throw all the way back to the client.py
     if 'Bad Client Version' in response.get('error', ''):
         raise BadVersionException();
+
+    # The server wants to know what this machine has: answer it, and ask again after the usual wait
+    if 'describe' in response:
+        server_describe(config, response['describe'])
+        config.workload = None
+        return
+
+    # Nothing for this worker yet (pending approval, switched off): say why once, and keep asking
+    if 'wait' in response:
+        if response['wait'] != config.last_wait:
+            print('Waiting: %s' % (response['wait']))
+            config.last_wait = response['wait']
+        config.workload = None
+        return
+    config.last_wait = None
 
     # Something very bad happened. Re-initialize the Client
     if 'error' in response:
@@ -1296,8 +1416,7 @@ def safe_download_network_weights(config, branch):
     if not net_sha or net_sha == 'None':
         return None
 
-    credentials = (config.server, config.username, config.password)
-    utils.download_network(*credentials, engine, net_name, net_sha, net_path)
+    utils.download_network(config.server, config.token, engine, net_name, net_sha, net_path)
 
     return net_path
 
@@ -1355,7 +1474,7 @@ def download_engine(config, branch, net_path):
     out_path = os.path.join('Engines', bin_name)
 
     make_path = config.workload['test'][branch]['build']['path']
-    compiler  = config.compilers[engine][0]
+    compiler  = config.compilers[engine][0] if engine in config.compilers else config.cxx_comp
 
     try:
         return utils.prepare_engine(engine, net_path, branch_name, source, make_path, out_path, private, compiler)
@@ -1555,6 +1674,7 @@ def run_openbench_worker(client_args):
     args   = parse_arguments(client_args) # Merge client.py and worker.py args
     config = Configuration(args)          # Holds System info, args, and Workload info
 
+    try_forever(server_hello, [config], setup_error)
     try_forever(server_configure_fastchess, [config], fastchess_error)
     try_forever(server_configure_worker, [config], setup_error)
 
@@ -1605,6 +1725,7 @@ def run_openbench_worker(client_args):
             time.sleep(TIMEOUT_ERROR)
             config = Configuration(args)
 
+            try_forever(server_hello, [config], setup_error)
             try_forever(server_configure_fastchess, [config], fastchess_error)
             try_forever(server_configure_worker, [config], setup_error)
 
