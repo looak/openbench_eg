@@ -1,61 +1,13 @@
 #!/bin/python3
 
-# What the worker tells the server about itself: the round trip of its last call (rtt_ms) and its GPUs (gpus).
-# Neither may ever fail a request. Run from UnitTests/ with the Client's requirements installed.
+# What the worker tells the server about itself: its GPUs (gpus).
+# It may never fail a request. Run from UnitTests/ with the Client's requirements installed.
 
-import itertools
 import os
 import sys
-import types
 
 PARENT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
 sys.path.insert(0, os.path.join(PARENT, 'Client'))
-
-
-class Reply:
-    def json(self): return {}
-
-
-def test_the_round_trip_is_sent_with_the_next_calls(monkeypatch):
-    import worker
-
-    sent  = {}
-    ticks = itertools.cycle([10.0, 10.2504]) # every call takes 250.4 ms
-    monkeypatch.setattr(worker.time, 'monotonic', lambda: next(ticks))
-    monkeypatch.setattr(worker.requests, 'post', lambda target, **kw: sent.update(target=target, **kw) or Reply())
-    monkeypatch.setattr(worker, 'LAST_RTT_MS', None)
-
-    config = types.SimpleNamespace(machine_id=1, secret_token='s', server='http://x', workload={ 'test' : { 'id' : 7 } })
-
-    # Nothing measured yet: nothing sent. The first call is measured: an integer, in milliseconds
-    worker.ServerReporter.report(config, 'clientHeartbeat', {})
-    assert 'rtt_ms' not in sent['data']
-    assert worker.LAST_RTT_MS == 250 and isinstance(worker.LAST_RTT_MS, int)
-
-    # ... and sent with the three calls that carry it, but not with the others
-    worker.ServerReporter.report(config, 'clientHeartbeat', {})
-    assert sent['data']['rtt_ms'] == 250
-    worker.ServerReporter.report(config, 'clientSubmitResults', {})
-    assert sent['data']['rtt_ms'] == 250
-    worker.ServerReporter.report(config, 'clientReportStep', {})
-    assert 'rtt_ms' not in sent['data']
-
-    config.blacklist = {}
-    worker.server_request_workload(config)
-    assert sent['data']['rtt_ms'] == 250 and sent['target'].endswith('clientGetWorkload')
-
-
-def test_a_failed_call_is_not_a_measurement(monkeypatch):
-    import worker
-
-    def fail(*args, **kw): raise worker.requests.ConnectionError()
-    monkeypatch.setattr(worker.requests, 'post', fail)
-    monkeypatch.setattr(worker, 'LAST_RTT_MS', 42)
-
-    config = types.SimpleNamespace(machine_id=1, secret_token='s', server='http://x')
-    try: worker.ServerReporter.report(config, 'clientHeartbeat', {})
-    except worker.requests.ConnectionError: pass
-    assert worker.LAST_RTT_MS == 42
 
 
 def test_gpus_are_names_and_any_failure_is_none(monkeypatch):

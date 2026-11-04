@@ -120,14 +120,10 @@ Upstream, plus:
 
 ### What the worker tells the server about itself
 
-Two fields, additive (client version unchanged, a server ignores what it doesn't know), neither able to fail a request:
-
-- `rtt_ms`: the round trip of the worker's last call to the server (`ServerReporter.report` and `clientGetWorkload`),
-  an integer in milliseconds, sent with `clientGetWorkload`, `clientHeartbeat` and `clientSubmitResults`. Absent until
-  one call has been measured; a call that failed is not a measurement.
-- `gpus`: a list of strings in `system_info`, sent to `clientWorkerInfo`: `lspci`'s VGA and 3D controllers on Linux
-  (under WSL `nvidia-smi -L` first, as `lspci` shows nothing useful there), the `Win32_VideoController` names through
-  PowerShell on Windows. Each tool gets 5 seconds; an empty list when none is found or anything fails.
+`gpus`, a list of strings in `system_info`, sent to `clientWorkerInfo`: `lspci`'s VGA and 3D controllers on Linux (under
+WSL `nvidia-smi -L` first, as `lspci` shows nothing useful there), the `Win32_VideoController` names through PowerShell
+on Windows. Each tool gets 5 seconds; an empty list when none is found or anything fails, and it can't fail the
+registration. Additive: the client version is unchanged, and a server ignores what it doesn't know.
 
 ### Reporting to nyayo
 

@@ -253,26 +253,6 @@ class Configuration:
         except OSError:
             self.huge_pages = 'UNKNOWN'
 
-LAST_RTT_MS = None # Round trip of the last call to the server, in whole milliseconds, sent with the next calls
-RTT_ENDPOINTS = ('clientGetWorkload', 'clientHeartbeat', 'clientSubmitResults')
-
-def timed_post(target, **kwargs):
-
-    # requests.post, noting how long the round trip took. Best effort: the timing never fails a request.
-    global LAST_RTT_MS
-    start    = time.monotonic()
-    response = requests.post(target, **kwargs)
-    try: LAST_RTT_MS = int(round((time.monotonic() - start) * 1000))
-    except Exception: pass
-    return response
-
-def with_rtt(payload):
-
-    # The last measured round trip, in the payload of the calls that carry it
-    if LAST_RTT_MS is not None:
-        payload['rtt_ms'] = LAST_RTT_MS
-    return payload
-
 def command_lines(command):
 
     # The lines a command prints, or none: a missing tool, a failure or a slow one is no GPU, never an error
@@ -317,10 +297,9 @@ class ServerReporter:
 
         payload['machine_id'] = config.machine_id
         payload['secret']     = config.secret_token
-        if endpoint in RTT_ENDPOINTS: with_rtt(payload)
 
         target   = utils.url_join(config.server, endpoint)
-        response = timed_post(target, data=payload, files=files, timeout=TIMEOUT_HTTP)
+        response = requests.post(target, data=payload, files=files, timeout=TIMEOUT_HTTP)
 
         # Check for a json repsone, to look for Client Version Errors
         try: as_json = response.json()
@@ -1199,9 +1178,8 @@ def server_request_workload(config):
     print('\nRequesting Workload from Server...')
 
     payload  = { 'machine_id' : config.machine_id, 'secret' : config.secret_token, 'blacklist' : blacklisted(config) }
-    with_rtt(payload)
     target   = utils.url_join(config.server, 'clientGetWorkload')
-    response = timed_post(target, data=payload, timeout=TIMEOUT_HTTP)
+    response = requests.post(target, data=payload, timeout=TIMEOUT_HTTP)
 
     # Server errors produce garbage back, which we should not alarm a user with
     try: response = response.json()
